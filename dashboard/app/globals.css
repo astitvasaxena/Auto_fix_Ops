@@ -10,8 +10,10 @@
   --text-primary: #e4e4ef;
   --text-secondary: #8888a0;
   --text-muted: #555566;
-  --accent: #7c3aed;
-  --accent-glow: rgba(124, 58, 237, 0.15);
+  --accent: #FC6C26;
+  --accent-hover: #e85a15;
+  --accent-glow: rgba(252, 108, 38, 0.12);
+  --vanilla: #FFF8DF;
   --success: #10b981;
   --success-bg: rgba(16, 185, 129, 0.1);
   --warning: #f59e0b;
@@ -65,7 +67,7 @@ body {
 .sidebar-logo h1 {
   font-size: 18px;
   font-weight: 700;
-  background: linear-gradient(135deg, var(--accent), #a78bfa);
+  background: linear-gradient(135deg, var(--accent), var(--vanilla));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   letter-spacing: -0.5px;
@@ -107,6 +109,7 @@ body {
 .sidebar-nav a.active {
   background: var(--accent-glow);
   color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .sidebar-nav .nav-icon {
@@ -182,6 +185,7 @@ body {
   font-size: 22px;
   font-weight: 700;
   letter-spacing: -0.5px;
+  color: var(--vanilla);
 }
 
 .page-header p {
@@ -286,6 +290,7 @@ body {
 .badge.context_built { background: rgba(139,92,246,0.1); color: #8b5cf6; }
 .badge.diagnosed { background: rgba(139,92,246,0.15); color: #a78bfa; }
 .badge.policy_approved { background: var(--success-bg); color: var(--success); }
+.badge.remediating { background: var(--warning-bg); color: var(--warning); }
 .badge.pending_pr_merge { background: var(--warning-bg); color: var(--warning); }
 .badge.verified { background: var(--success-bg); color: var(--success); }
 .badge.resolved { background: rgba(16,185,129,0.2); color: #34d399; }
@@ -309,9 +314,9 @@ body {
 
 .btn-primary {
   background: var(--accent);
-  color: white;
+  color: var(--bg-primary);
 }
-.btn-primary:hover { background: #6d28d9; }
+.btn-primary:hover { background: var(--accent-hover); }
 
 .btn-danger {
   background: var(--danger-red);
@@ -677,4 +682,77 @@ body {
 @keyframes slideUp {
   from { transform: translateY(20px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
+}
+
+/* ─── Pipeline flow visualization (incidents page) ─── */
+.flow-card { margin-bottom: 20px; padding: 18px 20px; }
+.flow-header {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 16px;
+}
+.flow-title {
+  font-size: 12px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--text-secondary);
+}
+.flow-highlight { color: var(--vanilla); }
+.flow-track {
+  display: flex; align-items: center;
+  overflow-x: auto; padding: 6px 2px 10px;
+  perspective: 800px;
+}
+.flow-step { display: flex; align-items: center; flex: 1 0 auto; }
+.flow-link {
+  flex: 1 1 auto; min-width: 16px; height: 2px; margin: 0 4px;
+  background: var(--border-bright); border-radius: 2px;
+}
+.flow-link.lit { background: linear-gradient(90deg, var(--success), var(--accent)); opacity: 0.7; }
+.flow-link.flowing {
+  opacity: 1;
+  background: repeating-linear-gradient(90deg, var(--accent) 0 6px, transparent 6px 12px);
+  background-size: 24px 2px;
+  animation: flowDash 0.9s linear infinite;
+}
+.flow-node {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  min-width: 92px; padding: 10px 10px 8px;
+  background: linear-gradient(160deg, var(--bg-card-hover), var(--bg-secondary));
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 4px 0 #0c0c14, 0 8px 16px rgba(0,0,0,0.45);
+  color: var(--text-secondary);
+  font-family: inherit; cursor: pointer;
+  transform: rotateX(6deg);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.flow-node:hover, .flow-node.selected, .flow-node:focus-visible {
+  transform: rotateX(0deg) translateY(-3px);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.06) inset, 0 6px 0 #0c0c14, 0 12px 22px rgba(0,0,0,0.5);
+  outline: none;
+}
+.flow-node.selected { border-color: var(--text-muted); }
+.flow-icon { font-size: 18px; line-height: 1; }
+.flow-label { font-size: 11px; font-weight: 600; white-space: nowrap; }
+.flow-node.completed { border-color: rgba(16,185,129,0.4); color: var(--success); }
+.flow-node.warning { border-color: rgba(245,158,11,0.5); color: var(--warning); }
+.flow-node.failed { border-color: rgba(239,68,68,0.5); color: var(--error); }
+.flow-node.active {
+  border-color: var(--accent); color: var(--vanilla);
+  background: linear-gradient(160deg, rgba(252,108,38,0.22), var(--bg-secondary));
+  box-shadow: 0 1px 0 rgba(255,248,223,0.08) inset, 0 4px 0 #2a1208, 0 0 18px var(--accent-glow), 0 8px 16px rgba(0,0,0,0.45);
+  animation: flowGlow 2.4s ease-in-out infinite;
+}
+.flow-desc {
+  margin-top: 8px; padding: 10px 12px; min-height: 40px;
+  font-size: 13px; color: var(--text-secondary);
+  background: var(--bg-secondary); border-radius: var(--radius);
+  border-left: 2px solid var(--accent);
+}
+@keyframes flowDash { to { background-position: 24px 0; } }
+@keyframes flowGlow {
+  0%, 100% { box-shadow: 0 1px 0 rgba(255,248,223,0.08) inset, 0 4px 0 #2a1208, 0 0 10px var(--accent-glow), 0 8px 16px rgba(0,0,0,0.45); }
+  50% { box-shadow: 0 1px 0 rgba(255,248,223,0.08) inset, 0 4px 0 #2a1208, 0 0 22px rgba(252,108,38,0.28), 0 8px 16px rgba(0,0,0,0.45); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-node, .flow-node.active, .flow-link.flowing { animation: none; transition: none; }
+  .flow-node, .flow-node:hover, .flow-node.selected { transform: none; }
 }

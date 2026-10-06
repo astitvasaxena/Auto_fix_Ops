@@ -61,7 +61,7 @@ function CooldownTimer({ faultId, cooldowns }) {
 }
 
 export default function ChaosPage() {
-  const [targetUrl, setTargetUrl] = useState('https://shortener-api-qurk.onrender.com');
+  const [targetUrl, setTargetUrl] = useState('http://localhost:8001');
   const [confirms, setConfirms] = useState({});
   const [results, setResults] = useState({});
   const [loading, setLoading] = useState({});

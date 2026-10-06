@@ -2,11 +2,16 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '../../lib/api';
+import PipelineFlow from '../../components/PipelineFlow';
 
-const STATUSES = ['ALL', 'INGESTED', 'CONTEXT_BUILT', 'DIAGNOSED', 'POLICY_APPROVED', 'PENDING_PR_MERGE', 'ESCALATED', 'RESOLVED', 'FAILED'];
+const STATUSES = ['ALL', 'INGESTED', 'CONTEXT_BUILT', 'DIAGNOSED', 'POLICY_APPROVED', 'REMEDIATING', 'PENDING_PR_MERGE', 'VERIFIED', 'ESCALATED', 'RESOLVED', 'FAILED'];
 
 function timeAgo(dateStr) {
-  const diff = Date.now() - new Date(dateStr).getTime();
+  if (!dateStr) return '—';
+  // API sends naive UTC ISO strings (no offset); without a 'Z' the browser
+  // would parse them as local time and skew by the local UTC offset.
+  const hasTz = /(Z|[+-]\d{2}:?\d{2})$/.test(dateStr);
+  const diff = Date.now() - new Date(hasTz ? dateStr : `${dateStr}Z`).getTime();
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return `${mins}m ago`;
@@ -35,7 +40,8 @@ export default function IncidentsPage() {
         load();
       }
     });
-    return cleanup;
+    const interval = setInterval(load, 5000);
+    return () => { clearInterval(interval); cleanup(); };
   }, [filter]);
 
   return (
@@ -47,6 +53,8 @@ export default function IncidentsPage() {
         </div>
         <span className="mono text-muted text-sm">{incidents.length} total</span>
       </div>
+
+      <PipelineFlow incident={incidents[0]} />
 
       <div className="filter-bar">
         {STATUSES.map((s) => (

@@ -34,6 +34,11 @@ class IncidentStatus(str, enum.Enum):
     VERIFIED = "VERIFIED"
     FAILED = "FAILED"
     RESOLVED = "RESOLVED"
+    # Inert legacy values from the removed Human Approval #1 feature. They are
+    # kept ONLY so rows already stored with them still load. No transition
+    # leads to or from them (absent from VALID_TRANSITIONS → terminal).
+    HUMAN_APPROVED = "HUMAN_APPROVED"
+    HUMAN_REJECTED = "HUMAN_REJECTED"
 
 
 class ExecutionStatus(str, enum.Enum):
@@ -76,6 +81,9 @@ class Incident(Base):
     diagnosis_reasoning = Column(Text, nullable=True)
     diagnosed_by = Column(String, nullable=True)  # "RULE_ENGINE" or "AI_ENGINE"
 
+    # Structured AI Incident Report (analysis stage; recommendation only)
+    ai_report = Column(JSON, nullable=True)
+
     # Target resolution (populated by target resolver before remediation)
     resolved_target = Column(JSON, nullable=True)
 
@@ -100,10 +108,12 @@ class Incident(Base):
         if new_status == IncidentStatus.RESOLVED:
             self.resolved_at = datetime.datetime.utcnow()
         
-        # Append to timeline
-        timeline = self.status_timeline if self.status_timeline else []
-        timeline.append({"status": new_status.value, "timestamp": datetime.datetime.utcnow().isoformat()})
-        self.status_timeline = timeline
+        # Append to timeline. Assign a new list: SQLAlchemy does not detect
+        # in-place mutation of a plain JSON column, so appending to the loaded
+        # list would never be persisted.
+        self.status_timeline = list(self.status_timeline or []) + [
+            {"status": new_status.value, "timestamp": datetime.datetime.utcnow().isoformat()}
+        ]
 
 
 class RemediationAudit(Base):

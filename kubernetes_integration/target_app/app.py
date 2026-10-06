@@ -1,5 +1,7 @@
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI, Response
 import asyncio
+import os
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 app = FastAPI(title="AutoFixOps Target App")
 
@@ -10,6 +12,12 @@ cpu_stress_flag = False
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics():
+    """Exposes the standard process metrics Prometheus scrapes."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/leak")
 def leak():
@@ -33,6 +41,19 @@ def cpu():
     while cpu_stress_flag:
         pass
     return {"status": "cpu_spiking"}
+
+
+async def _terminate_after_response():
+    """Lets the chaos caller receive its acknowledgement before process exit."""
+    await asyncio.sleep(0.1)
+    os._exit(1)
+
+
+@app.get("/_chaos/crash", status_code=202)
+async def crash(background_tasks: BackgroundTasks):
+    """Existing crash-loop chaos hook used by the dashboard and API wrapper."""
+    background_tasks.add_task(_terminate_after_response)
+    return {"status": "crashing"}
 
 @app.get("/recover")
 def recover():

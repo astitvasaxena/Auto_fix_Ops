@@ -11,15 +11,15 @@ groups:
       # within a 2-minute window (indicates active leak).
       - alert: TargetAppMemoryLeak
         expr: >
-          (process_resident_memory_bytes{job="shortener-api"}
-           - process_resident_memory_bytes{job="shortener-api"} offset 2m)
+          (process_resident_memory_bytes{job="autofixops-target"}
+           - process_resident_memory_bytes{job="autofixops-target"} offset 2m)
           > 50000000
         for: 15s
         labels:
           severity: critical
-          namespace: shortener
-          pod: shortener-api
-          container: api
+          namespace: autofixops
+          pod: autofixops-target-app
+          container: target-app
         annotations:
           summary: "Memory leak detected on shortener-api"
           description: >
@@ -31,13 +31,13 @@ groups:
       # ── High Absolute Memory ─────────────────────────────────
       # Fires when RSS exceeds 150MB (baseline is ~85MB).
       - alert: HighMemoryUsage
-        expr: process_resident_memory_bytes{job="shortener-api"} > 150000000
+        expr: process_resident_memory_bytes{job="autofixops-target"} > 150000000
         for: 15s
         labels:
           severity: warning
-          namespace: shortener
-          pod: shortener-api
-          container: api
+          namespace: autofixops
+          pod: autofixops-target-app
+          container: target-app
         annotations:
           summary: "High memory usage on shortener-api"
           description: >
@@ -50,13 +50,13 @@ groups:
       # process_start_time_seconds. Render restarts too fast
       # for the `up==0` approach to catch.
       - alert: TargetAppCrashLoop
-        expr: changes(process_start_time_seconds{job="shortener-api"}[5m]) > 0
+        expr: changes(process_start_time_seconds{job="autofixops-target"}[5m]) > 0
         for: 0s
         labels:
           severity: critical
-          namespace: shortener
-          pod: shortener-api
-          container: api
+          namespace: autofixops
+          pod: autofixops-target-app
+          container: target-app
         annotations:
           summary: "Target app is crash-looping (process restarted)"
           description: >
@@ -68,13 +68,13 @@ groups:
       # ── Target Completely Down ───────────────────────────────
       # Fires if the scrape target is totally unreachable for 30s.
       - alert: TargetAppDown
-        expr: up{job="shortener-api"} == 0
+        expr: up{job="autofixops-target"} == 0
         for: 30s
         labels:
           severity: critical
-          namespace: shortener
-          pod: shortener-api
-          container: api
+          namespace: autofixops
+          pod: autofixops-target-app
+          container: target-app
         annotations:
           summary: "Target app is completely unreachable"
           description: >

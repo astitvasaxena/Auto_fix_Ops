@@ -41,6 +41,7 @@ export const api = {
 
   // Prometheus
   checkPrometheusHealth: () => fetchAPI('/api/v1/prometheus/health'),
+  getTargetHealth: () => fetchAPI('/api/v1/target/health'),
 
   // Service Account
   getServiceAccount: () => fetchAPI('/api/v1/service-account'),
@@ -59,7 +60,18 @@ export const api = {
         console.error('Failed to parse WS event:', err);
       }
     };
-    ws.onerror = (e) => console.error('WS Error:', e);
-    return () => ws.close();
+    // A WS failure is non-fatal (pages also poll), so warn instead of
+    // console.error, which Next.js dev surfaces as an error overlay.
+    let closedByUs = false;
+    ws.onerror = () => {
+      if (!closedByUs) console.warn(`WS unavailable at ${wsUrl}; relying on polling.`);
+    };
+    return () => {
+      closedByUs = true;
+      // Closing while still CONNECTING (e.g. StrictMode dev remount) fires an
+      // error event; wait for open and close then instead.
+      if (ws.readyState === WebSocket.CONNECTING) ws.onopen = () => ws.close();
+      else ws.close();
+    };
   },
 };

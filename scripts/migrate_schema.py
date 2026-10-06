@@ -28,6 +28,7 @@ MIGRATIONS = [
     ("incidents", "project_id",            'UUID'),
     ("incidents", "resolved_target",       'JSON'),
     ("incidents", "status_timeline",       'JSON'),
+    ("incidents", "ai_report",             'JSON'),
 
     # remediation_audits
     ("remediation_audits", "project_id",          'UUID'),

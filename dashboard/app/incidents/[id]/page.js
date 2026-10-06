@@ -54,6 +54,154 @@ function PipelineFlow({ status }) {
   );
 }
 
+const PROVIDER_LABELS = { ollama: 'Ollama', openai: 'OpenAI' };
+// Older stored reports cite the retired synthetic runbooks; label them as such.
+const SOURCE_TYPE_LABELS = { official_documentation: 'Official documentation', synthetic_runbook: 'Synthetic runbook (retired)' };
+const RISK_COLORS = { LOW: 'var(--success)', MEDIUM: 'var(--warning)', HIGH: 'var(--error)' };
+const SECTION_LABEL = { fontSize: 12, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' };
+const LIST_STYLE = { margin: 0, paddingLeft: 18, color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6 };
+
+// "qwen2.5:3b" + "ollama" → "Qwen 2.5 3B (Ollama)"; unknown formats are shown as-is.
+function analystLabel(model, provider) {
+  const m = /^([a-z]+)([\d.]*)(?::(\d+(?:\.\d+)?)b)?$/i.exec(model || '');
+  const name = m
+    ? [m[1][0].toUpperCase() + m[1].slice(1), m[2], m[3] && `${m[3]}B`].filter(Boolean).join(' ')
+    : (model || 'unknown model');
+  return `${name} (${PROVIDER_LABELS[provider] || provider || 'unknown provider'})`;
+}
+
+function AIReportSection({ label, hint, children }) {
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={SECTION_LABEL}>
+        {label}
+        {hint && <span style={{ textTransform: 'none', letterSpacing: 0, marginLeft: 8 }}>· {hint}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function AIReportCard({ report }) {
+  const action = report.proposed_action || {};
+  const risk = report.risk_impact || {};
+  const runbooks = report.retrieved_runbook_evidence || [];
+  const confidence = report.confidence ?? 0;
+
+  return (
+    <div className="card mb-16">
+      <div className="flex justify-between items-center" style={{ marginBottom: 12 }}>
+        <h3 style={{ fontSize: 14, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+          🤖 AI Incident Analysis
+        </h3>
+        <span className="text-sm text-muted">AI Analyst: {analystLabel(report.model, report.llm_provider)}</span>
+      </div>
+
+      {report.incident_summary && (
+        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{report.incident_summary}</p>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
+        <div>
+          <div style={SECTION_LABEL}>Incident Type</div>
+          <span className="mono" style={{ fontSize: 16, fontWeight: 700 }}>{report.incident_type || '—'}</span>
+        </div>
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', ...SECTION_LABEL }}>
+            <span>Confidence</span>
+            <span className="mono">{(confidence * 100).toFixed(0)}%</span>
+          </div>
+          <div style={{ height: 6, background: 'var(--bg-primary)', borderRadius: 3, overflow: 'hidden' }}>
+            <div style={{
+              height: '100%', width: `${confidence * 100}%`, borderRadius: 3,
+              background: confidence >= 0.8 ? 'var(--success)' : 'var(--warning)',
+            }} />
+          </div>
+        </div>
+      </div>
+
+      <AIReportSection label="Root Cause Analysis" hint="AI inference">
+        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{report.root_cause_analysis}</p>
+      </AIReportSection>
+
+      <AIReportSection label="Observed Evidence" hint="from this incident">
+        <ul style={LIST_STYLE}>
+          {(report.observed_evidence || []).map((e, i) => <li key={i}>{e}</li>)}
+        </ul>
+      </AIReportSection>
+
+      <AIReportSection label="RAG / Operational Guidance" hint="curated from official documentation — not past incidents">
+        {runbooks.length === 0 ? (
+          <p className="text-sm text-muted">
+            No relevant guidance was found{report.rag?.status ? ` (${report.rag.status})` : ''}.
+          </p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {runbooks.map((rb) => (
+              <div key={rb.runbook_id} style={{ background: 'var(--bg-secondary)', padding: 12, borderRadius: 8 }}>
+                <div className="flex justify-between items-center">
+                  <span style={{ fontWeight: 600 }}>
+                    {rb.source_organization ? `${rb.source_organization} — ${rb.source_title}` : rb.title}
+                  </span>
+                  <span className="mono text-sm text-muted">Similarity {rb.similarity_score?.toFixed(2)}</span>
+                </div>
+                <div className="text-sm text-muted" style={{ marginTop: 4 }}>
+                  Source: {SOURCE_TYPE_LABELS[rb.source_type] || rb.source_type} · Status:{' '}
+                  {rb.source_status ? rb.source_status[0].toUpperCase() + rb.source_status.slice(1) : '—'} /{' '}
+                  {rb.verified ? 'verified' : 'unverified'}
+                </div>
+                <div className="text-sm" style={{ color: 'var(--text-secondary)', marginTop: 8 }}>
+                  <span className="text-muted">Guidance used: </span>{rb.guidance_used}
+                </div>
+                {rb.source_url && (
+                  <div className="text-sm" style={{ marginTop: 6 }}>
+                    <span className="text-muted">Source: </span>
+                    <a href={rb.source_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)' }}>
+                      {rb.source_url}
+                    </a>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </AIReportSection>
+
+      <AIReportSection label="Reasoning" hint="AI inference">
+        <ul style={LIST_STYLE}>
+          {(report.reasoning || []).map((r, i) => <li key={i}>{r}</li>)}
+        </ul>
+      </AIReportSection>
+
+      <AIReportSection label="Recommended Remediation">
+        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>{report.recommended_remediation}</p>
+      </AIReportSection>
+
+      <AIReportSection label="Risk / Impact">
+        <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+          <span className="mono" style={{ color: RISK_COLORS[risk.level] || 'var(--text-secondary)', fontWeight: 700, marginRight: 8 }}>
+            {risk.level || '—'}
+          </span>
+          {risk.description}
+        </p>
+      </AIReportSection>
+
+      <AIReportSection label="Proposed Action">
+        <div style={{ border: '1px solid var(--warning)', borderRadius: 8, padding: 12 }}>
+          <div className="flex justify-between items-center">
+            <span className="mono" style={{ fontWeight: 700 }}>{action.type}</span>
+            <span className="text-sm" style={{ color: 'var(--warning)' }}>
+              {report.proposed_action_executed ? 'Executed' : 'Proposed action only — not executed'}
+            </span>
+          </div>
+          {action.target && <div className="text-sm text-muted" style={{ marginTop: 4 }}>Target: <span className="mono">{action.target}</span></div>}
+          {action.rationale && <p className="text-sm" style={{ color: 'var(--text-secondary)', marginTop: 4 }}>{action.rationale}</p>}
+        </div>
+      </AIReportSection>
+    </div>
+  );
+}
+
 export default function IncidentDetailPage() {
   const { id } = useParams();
   const router = useRouter();
@@ -106,8 +254,9 @@ export default function IncidentDetailPage() {
   if (!data) return <div className="page"><div className="empty-state"><div className="icon">❌</div><p>Incident not found</p></div></div>;
 
   const { incident, telemetry_context, remediation_audits } = data;
-  const audit = remediation_audits?.[0];
+  const audit = remediation_audits?.[0] || {};
   const resolved = incident.resolved_target;
+  const policyDecision = incident.policy_decision;
 
   return (
     <div className="page">
@@ -128,6 +277,9 @@ export default function IncidentDetailPage() {
       <div className="card mb-16">
         <PipelineFlow status={incident.status} />
       </div>
+
+      {/* AI Incident Analysis (stored ai_report; display only) */}
+      {incident.ai_report && <AIReportCard report={incident.ai_report} />}
 
       {/* Main Grid */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
@@ -274,7 +426,7 @@ export default function IncidentDetailPage() {
       )}
 
       {/* Policy Breakdown */}
-      {audit && (
+      {(policyDecision || remediation_audits?.[0]) && (
         <div className="card mt-16">
           <h3 style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
             Policy Decision Breakdown
@@ -286,21 +438,24 @@ export default function IncidentDetailPage() {
             </div>
             <div className="policy-gate">
               <span className="gate-icon">✅</span>
-              Namespace: {resolved?.namespace || 'autofixops'}
+              Decision: {policyDecision?.decision || audit?.policy_verdict || 'Pending'}
             </div>
             <div className="policy-gate">
               <span className="gate-icon">✅</span>
-              Circuit Breaker: CLOSED
+              Namespace: {resolved?.namespace || 'autofixops'}
             </div>
             <div className="policy-gate">
               <span className="gate-icon">{audit.action ? '✅' : '❌'}</span>
-              Action: {audit.action || 'N/A'}
+              Action: {policyDecision?.action_type || audit?.action || 'N/A'}
             </div>
             <div className="policy-gate">
               <span className="gate-icon">{audit.is_shadow === 'true' ? '🛡' : '🟢'}</span>
-              Mode: {audit.is_shadow === 'true' ? 'Shadow' : 'Live'}
+              Mode: {audit?.is_shadow === 'true' ? 'Shadow' : 'Policy only'}
             </div>
           </div>
+          {policyDecision?.reason && (
+            <p className="text-sm text-muted mt-16">{policyDecision.reason}</p>
+          )}
         </div>
       )}
 

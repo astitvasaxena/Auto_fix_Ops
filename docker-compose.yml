@@ -5,6 +5,19 @@ services:
     ports:
       - "6379:6379"
 
+  postgres:
+    image: postgres:15-alpine
+    container_name: autofixops-postgres
+    environment:
+      POSTGRES_USER: autofixops
+      POSTGRES_PASSWORD: autofixops_password
+      POSTGRES_DB: autofixops
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: autofixops-prometheus
@@ -40,3 +53,4 @@ services:
 volumes:
   prometheus_data:
   alertmanager_data:
+  postgres_data:

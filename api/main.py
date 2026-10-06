@@ -47,6 +47,15 @@ async def on_startup():
     logger.info("AutoFixOps API Gateway started successfully.")
 
 
+# Statuses that end an incident for ingestion de-duplication purposes.
+# HUMAN_APPROVED / HUMAN_REJECTED are inert legacy values (feature removed);
+# rows already in them can never move again, so they must count as closed.
+_CLOSED_STATUSES = [
+    IncidentStatus.RESOLVED, IncidentStatus.FAILED,
+    IncidentStatus.HUMAN_APPROVED, IncidentStatus.HUMAN_REJECTED,
+]
+
+
 def generate_dedup_key(alert: dict, window_seconds: int = 120) -> str:
     """Generates a time-bucketed deduplication fingerprint."""
     labels = alert.get("labels", {})
@@ -88,18 +97,40 @@ async def receive_alert(
             incident = (
                 db.query(Incident)
                 .filter(
-                    Incident.alert_fingerprint == dedup_key,
-                    Incident.status != IncidentStatus.RESOLVED,
+                    Incident.alert_name == alert_name,
+                    Incident.status.notin_(_CLOSED_STATUSES),
+                    Incident.project_id == default_project_id,
                 )
                 .order_by(Incident.created_at.desc())
                 .first()
             )
             if incident:
-                incident.status = IncidentStatus.RESOLVED
-                db.commit()
-                logger.info(f"=== [DB WRITE] Incident {incident.id} RESOLVED. ===")
+                logger.info(
+                    f"[ALERTMANAGER RESOLVED] Received resolved webhook for active incident {incident.id} "
+                    f"({alert_name}, current status: {incident.status.value})."
+                )
             else:
-                logger.warning(f"[DB WRITE IGNORED] Resolved — no active incident for {dedup_key}.")
+                logger.info(f"[ALERTMANAGER RESOLVED] No active incident found for {alert_name}.")
+            continue
+
+        # Prevent duplicate processing of the same active incident
+        active_incident = (
+            db.query(Incident)
+            .filter(
+                Incident.alert_name == alert_name,
+                Incident.status.notin_(_CLOSED_STATUSES),
+                Incident.project_id == default_project_id,
+            )
+            .order_by(Incident.created_at.desc())
+            .first()
+        )
+        if active_incident:
+            logger.info(
+                f"[DEDUP] Active incident {active_incident.id} already in progress for "
+                f"alert '{alert_name}' (status: {active_incident.status.value}). "
+                f"Skipping duplicate creation."
+            )
+            processed_incidents.append(str(active_incident.id))
             continue
 
         severity = alert.get("labels", {}).get("severity", "unknown")
@@ -208,6 +239,8 @@ def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
             "confidence": incident.diagnosis_confidence,
             "reasoning": incident.diagnosis_reasoning,
             "diagnosed_by": incident.diagnosed_by,
+            "ai_report": incident.ai_report,
+            "policy_decision": (incident.raw_payload_cache or {}).get("policy_decision"),
             "resolved_target": incident.resolved_target,
             "created_at": incident.created_at.isoformat() if incident.created_at else None,
         },
@@ -391,6 +424,33 @@ async def check_prometheus_health(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=f"Failed to reach Prometheus: {e}")
 
 
+@app.get("/api/v1/target/health")
+async def check_target_health(db: Session = Depends(get_db)):
+    """Target app HEALTHY/DOWN from Prometheus' `up` series (same signal as the TargetAppDown alert)."""
+    config = db.query(ProjectConfig).first()
+    prom_url = (
+        (config.prometheus_url if config else None)
+        or os.getenv("PROMETHEUS_URL", "")
+    )
+    if not prom_url:
+        return {"status": "UNKNOWN", "detail": "No Prometheus URL configured."}
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{prom_url.rstrip('/')}/api/v1/query",
+                params={"query": 'up{job="autofixops-target"}'},
+            )
+        resp.raise_for_status()
+        results = resp.json().get("data", {}).get("result", [])
+        if not results:
+            return {"status": "UNKNOWN", "detail": "No scrape data for target."}
+        up = any(float(r["value"][1]) == 1 for r in results)
+        return {"status": "HEALTHY" if up else "DOWN"}
+    except Exception as e:
+        return {"status": "UNKNOWN", "detail": f"Failed to query Prometheus: {e}"}
+
+
 # ════════════════════════════════════════════════════════════
 # ENDPOINT 7: System Mode (Kill Switch)
 # ════════════════════════════════════════════════════════════
@@ -480,6 +540,16 @@ import httpx
 
 CHAOS_RATE_LIMIT: dict = {}  # {project_id:fault_type: timestamp}
 CHAOS_COOLDOWN_SECONDS = 60
+CPU_CHAOS_TASKS: set = set()
+
+
+async def _run_blocking_cpu_chaos(url: str):
+    """Calls the target's intentionally non-returning CPU endpoint in background."""
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            await client.get(url)
+    except Exception as e:
+        logger.warning(f"[CHAOS] CPU spike request ended unexpectedly: {e}")
 
 
 @app.post("/api/v1/chaos/inject")
@@ -524,8 +594,8 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
 
     # Route to target app endpoint
     endpoint_map = {
-        "memory_leak": "/_chaos/leak",
-        "cpu_spike": "/_chaos/cpu",
+        "memory_leak": "/leak",
+        "cpu_spike": "/cpu",
         "crash_loop": "/_chaos/crash",
     }
     endpoint = endpoint_map.get(fault_type)
@@ -539,12 +609,24 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
     target_url = target_url.rstrip("/").replace("/_chaos", "").replace("/chaos", "")
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            url = f"{target_url}{endpoint}"
+        url = f"{target_url}{endpoint}"
+        if fault_type == "cpu_spike":
+            # /cpu deliberately never returns, so validate the reachable target
+            # first and then let the existing GET run independently.
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                health = await client.get(f"{target_url}/health")
+                health.raise_for_status()
+            task = asyncio.create_task(_run_blocking_cpu_chaos(url))
+            CPU_CHAOS_TASKS.add(task)
+            task.add_done_callback(CPU_CHAOS_TASKS.discard)
+            response_code = 202
+        else:
             if fault_type == "memory_leak":
                 url += "?mb=50"
-            resp = await client.post(url)
-        logger.info(f"[CHAOS] Injected {fault_type} via {url} → {resp.status_code}")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+            response_code = resp.status_code
+        logger.info(f"[CHAOS] Injected {fault_type} via {url} → {response_code}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to reach target: {str(e)}")
 
@@ -594,7 +676,7 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
         "status": "injected",
         "fault_type": fault_type,
         "target": f"{target_url}{endpoint}",
-        "response_code": resp.status_code,
+        "response_code": response_code,
         "cooldown_seconds": CHAOS_COOLDOWN_SECONDS,
     }
 

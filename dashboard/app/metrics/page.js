@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../../lib/api';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid } from 'recharts';
 
-const COLORS = { success: '#10b981', error: '#ef4444', warning: '#f59e0b', info: '#3b82f6', accent: '#7c3aed', muted: '#555566' };
+const COLORS = { success: '#10b981', error: '#ef4444', warning: '#f59e0b', info: '#3b82f6', accent: '#FC6C26', muted: '#555566' };
 
 export default function MetricsPage() {
   const [metrics, setMetrics] = useState(null);

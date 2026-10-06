@@ -22,19 +22,20 @@ from api.models import (
     Incident, IncidentStatus, RemediationAudit,
     ExecutionStatus, FailureRootCause
 )
+from api.events import emit_sync
 from engine.memory import QdrantMemoryStore
 
 logger = logging.getLogger("autofixops")
 
 # Verification constants
-PR_POLL_INTERVAL_SECONDS = 60
-PR_POLL_MAX_ATTEMPTS = 30       # 30 minutes max wait
-POST_MERGE_COOLDOWN_SECONDS = 300  # 5 minutes for GitOps sync
+PR_POLL_INTERVAL_SECONDS = int(os.getenv("PR_POLL_INTERVAL_SECONDS", "10"))
+PR_POLL_MAX_ATTEMPTS = int(os.getenv("PR_POLL_MAX_ATTEMPTS", "10"))
+POST_MERGE_COOLDOWN_SECONDS = int(os.getenv("POST_MERGE_COOLDOWN_SECONDS", "5"))
 
 # Robustness settings
-STABILITY_WINDOW_MINUTES = 5
-STABILITY_CHECK_INTERVAL_SECONDS = 60
-CONSECUTIVE_PASSES_REQUIRED = 2
+STABILITY_WINDOW_CHECKS = int(os.getenv("STABILITY_WINDOW_CHECKS", "2"))
+STABILITY_CHECK_INTERVAL_SECONDS = int(os.getenv("STABILITY_CHECK_INTERVAL_SECONDS", "3"))
+CONSECUTIVE_PASSES_REQUIRED = int(os.getenv("CONSECUTIVE_PASSES_REQUIRED", "2"))
 HEALTH_CHECK_THRESHOLD = 0.80
 WORSENING_THRESHOLD = 1.20  # 20% increase = worsening
 
@@ -124,8 +125,10 @@ class VerificationEngine:
             if stability_result["passed"]:
                 audit.execution_status = ExecutionStatus.VERIFICATION_PASSED
                 incident.transition_to(IncidentStatus.VERIFIED)
+                emit_sync("incident.status_changed", {"new_status": "VERIFIED"}, str(incident.id))
                 db.commit()
                 incident.transition_to(IncidentStatus.RESOLVED)
+                emit_sync("incident.status_changed", {"new_status": "RESOLVED"}, str(incident.id))
                 db.commit()
 
                 logger.info(f"[TRACE:{incident_id}] [VERIFICATION PASSED] Incident RESOLVED.")
@@ -146,6 +149,7 @@ class VerificationEngine:
                 audit.failure_reason = stability_result.get("reason", "verification_failed")
                 audit.failure_root_cause = self._classify_failure(stability_result)
                 incident.transition_to(IncidentStatus.FAILED)
+                emit_sync("incident.status_changed", {"new_status": "FAILED"}, str(incident.id))
                 db.commit()
 
                 logger.warning(
@@ -186,7 +190,7 @@ class VerificationEngine:
         Also detects negative signals (worsening metrics).
         """
         consecutive_passes = 0
-        total_checks = STABILITY_WINDOW_MINUTES  # One check per minute
+        total_checks = STABILITY_WINDOW_CHECKS
         check_results = []
 
         for check_num in range(1, total_checks + 1):
@@ -234,8 +238,30 @@ class VerificationEngine:
         baseline_metrics: Dict[str, float],
     ) -> Dict[str, Any]:
         """
-        Single health check pass. Checks multiple metrics + negative signals.
+        Single health check pass. Checks target liveness, metrics, and negative signals.
         """
+        # ─── Liveness Check ───
+        try:
+            up_resp = requests.get(
+                f"{self.prometheus_url.rstrip('/')}/api/v1/query",
+                params={"query": 'up{job="autofixops-target"}'},
+                timeout=5,
+            )
+            up_resp.raise_for_status()
+            up_results = up_resp.json().get("data", {}).get("result", [])
+            if not up_results:
+                logger.warning(f"[TRACE:{incident_id}] Target liveness check: no Prometheus scrape data.")
+                return {"healthy": False, "reason": "No Prometheus scrape data for target (autofixops-target)"}
+            is_up = any(float(r["value"][1]) == 1 for r in up_results)
+            if not is_up:
+                logger.warning(f"[TRACE:{incident_id}] Target liveness check: target is DOWN (up == 0).")
+                return {"healthy": False, "reason": "Target app is DOWN (Prometheus up == 0)"}
+        except requests.Timeout:
+            return {"healthy": False, "reason": "Prometheus query timed out while checking target up"}
+        except Exception as e:
+            logger.warning(f"[TRACE:{incident_id}] Target health check: error querying Prometheus: {e}")
+            return {"healthy": False, "reason": f"Failed to query Prometheus: {e}"}
+
         namespace = self.config.get("target_namespace", "autofixops")
 
         queries = {

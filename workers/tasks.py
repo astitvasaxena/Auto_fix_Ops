@@ -12,9 +12,14 @@ All tasks thread project_id through the pipeline.
 Pipeline:
   build_incident_context  →  CONTEXT_BUILT
   diagnose_incident       →  DIAGNOSED
+                             (AI_INCIDENT_ANALYSIS=true, the default: stores the
+                              AI Incident Report and STOPS here — nothing below runs)
   evaluate_policy         →  POLICY_APPROVED / ESCALATED
   execute_remediation     →  PENDING_PR_MERGE
   verify_resolution       →  RESOLVED / FAILED
+
+Set PIPELINE_STOP_AFTER_POLICY=true only for a presentation that ends at the
+policy decision. It preserves the normal remediation pipeline by default.
 """
 
 import os
@@ -29,7 +34,9 @@ from api.events import emit_sync
 # Engine imports
 from engine.summarizer import ContextSummarizer
 from engine.baseline import RuleBasedDiagnosisEngine
-from engine.ai_diagnostics import AIDiagnosisEngine
+from engine.ai_diagnostics import (
+    AIDiagnosisEngine, build_analysis_context, build_runbook_query, retrieve_runbook_evidence,
+)
 from engine.memory import QdrantMemoryStore
 from engine.policy import PolicyDecisionEngine
 from engine.remediation import RemediationEngine
@@ -49,6 +56,45 @@ def _check_kill_switch(incident_id: str) -> bool:
 
 
 _DEFAULT_PROM_URL = os.getenv("PROMETHEUS_URL", "").strip()
+
+
+def _stop_after_policy() -> bool:
+    """Returns whether this run is intentionally limited to policy evaluation."""
+    return os.getenv("PIPELINE_STOP_AFTER_POLICY", "false").strip().lower() == "true"
+
+
+def _ai_analysis_enabled() -> bool:
+    """AI Incident Analysis stage: diagnose with context + runbook RAG + LLM report,
+    then stop at DIAGNOSED. Set AI_INCIDENT_ANALYSIS=false for the legacy
+    diagnosis → policy → remediation pipeline."""
+    return os.getenv("AI_INCIDENT_ANALYSIS", "true").strip().lower() == "true"
+
+
+def _generate_ai_report(incident, context_doc: dict, summary, rule_verdict: dict) -> dict:
+    """Builds context, retrieves curated runbooks and asks the analyst LLM for a report.
+    Raises on any LLM failure so the caller's retry handling can mark FAILED."""
+    incident_id = str(incident.id)
+    # Build the engine first: if the LLM is unavailable (e.g. no API key) fail fast.
+    ai_engine = AIDiagnosisEngine()
+
+    context = build_analysis_context(
+        incident_id, incident.alert_name, incident.severity,
+        incident.raw_payload_cache, context_doc, summary,
+    )
+    min_score = float(os.getenv("RAG_RUNBOOK_MIN_SCORE", "0.35"))
+    top_k = int(os.getenv("RAG_RUNBOOK_TOP_K", "3"))
+    query = build_runbook_query(context, rule_verdict)
+    hits, rag_status = retrieve_runbook_evidence(QdrantMemoryStore(), query, top_k, min_score)
+    logger.info(
+        f"[TRACE:{incident_id}] [AI ANALYST] Runbook RAG status={rag_status} "
+        f"hits={[(h['title'], h['similarity_score']) for h in hits]}"
+    )
+
+    rag_meta = {
+        "collection": "operational_runbooks", "query": query,
+        "min_score": min_score, "top_k": top_k, "status": rag_status,
+    }
+    return ai_engine.analyze_incident(context, rule_verdict, hits, rag_meta)
 
 
 def _get_prometheus_url(project_id: str = None) -> str:
@@ -149,11 +195,7 @@ def build_incident_context(self, incident_id: str):
 
     except Exception as e:
         logger.error(f"[TRACE:{incident_id}] [TASK 1 FAILED] {e}")
-        try:
-            self.retry(exc=e, countdown=2 ** self.request.retries)
-        except self.MaxRetriesExceededError:
-            _mark_failed(db, incident_id)
-            return False
+        return _retry_or_fail(self, db, incident_id, e, "build_incident_context")
     finally:
         db.close()
 
@@ -206,6 +248,30 @@ def diagnose_incident(self, incident_id: str):
         # Rule Engine first
         rule_engine = RuleBasedDiagnosisEngine()
         verdict = rule_engine.analyze(alert_name, context_doc)
+
+        # Analysis stage: context + runbook RAG + LLM report, then STOP at DIAGNOSED.
+        if _ai_analysis_enabled():
+            report = _generate_ai_report(incident, context_doc, summary, verdict)
+
+            incident.ai_report = report
+            incident.diagnosis_classification = report["incident_type"]
+            incident.diagnosis_confidence = report["confidence"]
+            incident.diagnosis_reasoning = report["root_cause_analysis"]
+            incident.diagnosed_by = "AI_ENGINE"
+            emit_sync("incident.diagnosed", {"classification": incident.diagnosis_classification, "confidence": incident.diagnosis_confidence, "engine": incident.diagnosed_by}, str(incident.id))
+
+            incident.transition_to(IncidentStatus.DIAGNOSED)
+            emit_sync("incident.status_changed", {"new_status": "DIAGNOSED"}, str(incident.id))
+            emit_sync("incident.ai_report_ready", {"proposed_action": report["proposed_action"]["type"], "confidence": report["confidence"]}, str(incident.id))
+            db.commit()
+
+            logger.info(
+                f"[TRACE:{incident_id}] === [TASK 2: AI ANALYSIS] DONE → DIAGNOSED "
+                f"(report ready; proposed {report['proposed_action']['type']}, NOT executed). "
+                f"Stopping: policy/remediation are not dispatched while AI_INCIDENT_ANALYSIS=true ==="
+            )
+            return True
+
         diagnosed_by = "RULE_ENGINE"
 
         # AI fallback if unknown
@@ -251,11 +317,7 @@ def diagnose_incident(self, incident_id: str):
 
     except Exception as e:
         logger.error(f"[TRACE:{incident_id}] [TASK 2 FAILED] {e}")
-        try:
-            self.retry(exc=e, countdown=2 ** self.request.retries)
-        except self.MaxRetriesExceededError:
-            _mark_failed(db, incident_id)
-            return False
+        return _retry_or_fail(self, db, incident_id, e, "diagnose_incident")
     finally:
         db.close()
 
@@ -289,6 +351,18 @@ def evaluate_policy(self, incident_id: str, verdict: dict):
         policy_engine = PolicyDecisionEngine()
         policy_result = policy_engine.evaluate(incident, verdict, namespace)
 
+        # Policy evaluation is not a remediation action. Store its result with
+        # the incident so the dashboard can show it without affecting the
+        # anti-thrash history in remediation_audits.
+        payload = dict(incident.raw_payload_cache or {})
+        payload["policy_decision"] = {
+            "decision": policy_result.decision,
+            "reason": policy_result.reason,
+            "action_type": verdict.get("action", {}).get("type", "UNKNOWN"),
+            "evaluated_at": time.time(),
+        }
+        incident.raw_payload_cache = payload
+
         logger.info(
             f"[TRACE:{incident_id}] [POLICY RESULT] "
             f"{policy_result.decision}: {policy_result.reason}"
@@ -299,8 +373,14 @@ def evaluate_policy(self, incident_id: str, verdict: dict):
             emit_sync("incident.status_changed", {"new_status": "POLICY_APPROVED"}, str(incident.id))
             db.commit()
 
-            # Chain to remediation
-            execute_remediation.apply_async(args=[incident_id, verdict])
+            if _stop_after_policy():
+                logger.info(
+                    f"[TRACE:{incident_id}] [PRESENTATION MODE] "
+                    "Stopping after approved policy decision."
+                )
+            else:
+                # Chain to remediation in the normal full pipeline.
+                execute_remediation.apply_async(args=[incident_id, verdict])
 
         elif policy_result.decision in ("ESCALATED", "REJECTED"):
             incident.transition_to(IncidentStatus.ESCALATED)
@@ -316,7 +396,7 @@ def evaluate_policy(self, incident_id: str, verdict: dict):
 
     except Exception as e:
         logger.error(f"[TRACE:{incident_id}] [TASK 3 FAILED] {e}")
-        _mark_failed(db, incident_id)
+        _mark_failed(db, incident_id, reason=f"{e.__class__.__name__}: {e}", stage="evaluate_policy")
         return False
     finally:
         db.close()
@@ -382,13 +462,13 @@ def execute_remediation(self, incident_id: str, verdict: dict):
             )
         except TargetResolutionError as e:
             logger.error(f"[TRACE:{incident_id}] [TARGET RESOLUTION FAILED] {e}")
-            _mark_failed(db, incident_id)
+            _mark_failed(db, incident_id, reason=f"TargetResolutionError: {e}", stage="execute_remediation")
             return False
 
         # Pre-execution validation
         if not resolver.validate_target(resolved_target):
             logger.error(f"[TRACE:{incident_id}] [TARGET VALIDATION FAILED]")
-            _mark_failed(db, incident_id)
+            _mark_failed(db, incident_id, reason="Target validation failed", stage="execute_remediation")
             return False
 
         # Store resolved target on incident
@@ -431,17 +511,13 @@ def execute_remediation(self, incident_id: str, verdict: dict):
                 pod_name,
                 baseline_metrics,
             ],
-            countdown=30,
+            countdown=5,
         )
         return True
 
     except Exception as e:
         logger.error(f"[TRACE:{incident_id}] [TASK 4 FAILED] {e}")
-        try:
-            self.retry(exc=e, countdown=2 ** self.request.retries)
-        except self.MaxRetriesExceededError:
-            _mark_failed(db, incident_id)
-            return False
+        return _retry_or_fail(self, db, incident_id, e, "execute_remediation")
     finally:
         db.close()
 
@@ -509,8 +585,20 @@ def verify_resolution(
 # Utility
 # ════════════════════════════════════════════════════════════
 
-def _mark_failed(db, incident_id: str):
-    """Safely marks an incident as FAILED after max retries."""
+def _retry_or_fail(task, db, incident_id: str, exc: Exception, stage: str):
+    """Retries the task, or marks the incident FAILED once retries are exhausted.
+
+    Celery's retry(exc=...) re-raises `exc` itself (not MaxRetriesExceededError)
+    when the limit is hit, so the limit is checked here before retrying.
+    """
+    if task.max_retries is not None and task.request.retries >= task.max_retries:
+        _mark_failed(db, incident_id, reason=f"{exc.__class__.__name__}: {exc}", stage=stage)
+        return False
+    raise task.retry(exc=exc, countdown=2 ** task.request.retries)
+
+
+def _mark_failed(db, incident_id: str, reason: str = None, stage: str = None):
+    """Safely marks an incident as FAILED, recording why in raw_payload_cache."""
     try:
         db.rollback()
         incident = db.query(Incident).filter(Incident.id == incident_id).first()
@@ -518,10 +606,24 @@ def _mark_failed(db, incident_id: str):
             IncidentStatus.FAILED,
             IncidentStatus.RESOLVED,
         ):
-            incident.status = IncidentStatus.FAILED
+            if reason:
+                payload = dict(incident.raw_payload_cache or {})
+                payload["pipeline_failure"] = {
+                    "stage": stage,
+                    "error": reason,
+                    "failed_at": time.time(),
+                }
+                incident.raw_payload_cache = payload
+            try:
+                incident.transition_to(IncidentStatus.FAILED)
+            except ValueError:
+                # e.g. ESCALATED has no modelled → FAILED edge; keep forcing it as before.
+                incident.status = IncidentStatus.FAILED
             db.commit()
+            emit_sync("incident.status_changed", {"new_status": "FAILED"}, str(incident.id))
             logger.critical(
-                f"[TRACE:{incident_id}] [FATAL] Incident marked FAILED after max retries."
+                f"[TRACE:{incident_id}] [FATAL] Incident marked FAILED"
+                f"{f' in {stage}' if stage else ''}: {reason or 'no reason recorded'}"
             )
     except Exception as e:
         logger.error(f"[TRACE:{incident_id}] Failed to mark FAILED: {e}")

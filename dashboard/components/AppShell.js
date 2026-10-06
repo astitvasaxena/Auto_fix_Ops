@@ -50,6 +50,26 @@ function KillSwitchBanner({ systemMode, onModeChange }) {
   );
 }
 
+function TargetHealthPill() {
+  const [health, setHealth] = useState(null);
+
+  useEffect(() => {
+    const load = () => api.getTargetHealth()
+      .then((h) => setHealth(h.status))
+      .catch(() => setHealth('UNKNOWN'));
+    load();
+    const interval = setInterval(load, 15000);
+    const cleanup = api.listenEvents((event) => {
+      if (event.type === 'incident.created') load();
+    });
+    return () => { clearInterval(interval); cleanup(); };
+  }, []);
+
+  if (!health) return null;
+  const cls = health === 'HEALTHY' ? 'live' : health === 'DOWN' ? 'open' : 'disconnected';
+  return <span className={`status-pill ${cls}`}>Target: {health}</span>;
+}
+
 function TopBar({ onModeChange }) {
   const [status, setStatus] = useState(null);
 
@@ -116,6 +136,8 @@ function TopBar({ onModeChange }) {
           <option value="SHADOW">🛡 SHADOW</option>
           <option value="DISABLED">🛑 DISABLED</option>
         </select>
+
+        <TargetHealthPill />
 
         <span className={`status-pill ${cbClass}`}>
           CB: {cbState}
