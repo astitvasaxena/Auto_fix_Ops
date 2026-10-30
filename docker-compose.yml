@@ -28,6 +28,7 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - ./monitoring/targets:/etc/prometheus/targets:ro
       - prometheus_data:/prometheus
     ports:
       - "9090:9090"

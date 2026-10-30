@@ -49,12 +49,12 @@ groups:
             of its memory limit (OOMKilled risk).
 
       # ── CrashLoop Detection (via process restart) ────────────
-      # Detects when the process has restarted at least once
-      # in the last 5 minutes by tracking changes in
-      # process_start_time_seconds. Fast restarts are too quick
-      # for the `up==0` approach to catch.
+      # Detects repeated restarts: the process start time changed more than
+      # once in the last 5 minutes. One restart (e.g. the rollout of an
+      # approved remediation, or a single OOMKill) is not a crash loop.
+      # Fast restarts are too quick for the `up==0` approach to catch.
       - alert: TargetAppCrashLoop
-        expr: changes(process_start_time_seconds{job="autofixops-target"}[5m]) > 0
+        expr: changes(process_start_time_seconds{job="autofixops-target"}[5m]) > 1
         for: 0s
         labels:
           severity: critical
