@@ -23,8 +23,10 @@ from .config_helpers import (
 )
 from workers.tasks import build_incident_context, execute_remediation
 from .events import ws_manager, redis_listener, emit_sync
+from .patch_proposals import router as patch_proposals_router
 
 app = FastAPI(title="AutoFixOps API Gateway")
+app.include_router(patch_proposals_router)   # Stage 2: AI patch proposals (proposal only, never applied)
 
 # CORS — allow dashboard direct access
 app.add_middleware(

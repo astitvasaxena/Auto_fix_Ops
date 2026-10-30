@@ -25,6 +25,7 @@ policy decision. It preserves the normal remediation pipeline by default.
 import os
 import requests
 import time
+import uuid
 from .celery_app import celery_app
 from api.database import SessionLocal, incident_contexts_collection, logger
 from api.models import Incident, IncidentStatus
@@ -270,6 +271,7 @@ def diagnose_incident(self, incident_id: str):
                 f"(report ready; proposed {report['proposed_action']['type']}, NOT executed). "
                 f"Stopping: policy/remediation are not dispatched while AI_INCIDENT_ANALYSIS=true ==="
             )
+            _route_patch_proposal(incident_id)
             return True
 
         diagnosed_by = "RULE_ENGINE"
@@ -627,3 +629,52 @@ def _mark_failed(db, incident_id: str, reason: str = None, stage: str = None):
             )
     except Exception as e:
         logger.error(f"[TRACE:{incident_id}] Failed to mark FAILED: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+# Stage 2: AI patch proposals (proposal only — never applied)
+# ════════════════════════════════════════════════════════════
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _patch_proposals_auto() -> bool:
+    from engine.patch_routing import auto_generation_enabled
+    return auto_generation_enabled()
+
+
+def _route_patch_proposal(incident_id: str):
+    """After AI diagnosis: record the confidence route and, on the automatic route, queue one
+    proposal run. Low-confidence incidents only get a PENDING decision (a human must approve).
+    Best effort: a failure here never changes the incident or the diagnosis result."""
+    if not _patch_proposals_auto():
+        return
+    from engine.patch_routing import request_generation
+    from engine.routing_policy import RoutingError
+
+    def dispatch(inc_id, decision_id, claim):
+        generate_patch_proposal.apply_async(args=[inc_id, decision_id, claim])
+
+    try:
+        result = request_generation(SessionLocal, uuid.UUID(incident_id), dispatch, trigger="diagnosis")
+        logger.info(f"[TRACE:{incident_id}] [PATCH ROUTING] {result['decision']['routing_mode']} "
+                    f"(started={result['started']})")
+    except RoutingError as exc:
+        logger.info(f"[TRACE:{incident_id}] [PATCH ROUTING] not started: {exc.code}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[TRACE:{incident_id}] [PATCH ROUTING] skipped: {exc.__class__.__name__}")
+
+
+@celery_app.task(bind=True, max_retries=0, time_limit=600, soft_time_limit=540)
+def generate_patch_proposal(self, incident_id: str, decision_id: str, claim: str = None):
+    """Runs the patch proposer for an authorised routing decision. Never applies anything:
+    the result is a stored proposal (VALIDATED / NOT_GENERATED / REJECTED / FAILED)."""
+    from engine.patch_routing import run_generation
+
+    logger.info(f"[TRACE:{incident_id}] === [STAGE 2: PATCH PROPOSAL] START (decision {decision_id}) ===")
+    result = run_generation(SessionLocal, incident_id, decision_id, claim, _REPO_ROOT)
+    emit_sync("incident.patch_proposal", {"status": result.get("status"), "reason_code": result.get("reason_code"),
+                                          "proposal_id": result.get("proposal_id")}, incident_id)
+    logger.info(f"[TRACE:{incident_id}] === [STAGE 2: PATCH PROPOSAL] DONE → {result.get('status')}"
+                f"/{result.get('reason_code')} (not applied) ===")
+    return result

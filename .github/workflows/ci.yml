@@ -53,6 +53,8 @@ env:
   MAIN_TEST_FILES: >-
     tests/ai/test_incident_analysis.py
     tests/ai/test_llm_provider.py
+    tests/ai/test_patch_proposals.py
+    tests/ai/test_patch_routing.py
     tests/rag/test_runbooks.py
     tests/safety_drills/test_bad_diagnosis.py
     tests/safety_drills/test_bad_patch.py
@@ -368,6 +370,9 @@ jobs:
 
       - name: Install dependencies (lockfile only)
         run: npm ci
+
+      - name: Unit tests (node:test, no network)
+        run: npm test
 
       - name: Production build
         run: npm run build
