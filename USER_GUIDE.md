@@ -99,7 +99,7 @@ A standard Alertmanager webhook is enough:
 receivers:
   - name: autofixops
     webhook_configs:
-      - url: http://<your-autofixops-host>:8000/api/v1/alerts
+      - url: http://<your-autofixops-host>:8010/api/v1/alerts
         send_resolved: true
 ```
 
@@ -288,8 +288,8 @@ docker compose up -d redis
 # 2. Initialize / migrate the Postgres schema (idempotent)
 ./venv/bin/python scripts/migrate_schema.py
 
-# 3. The API server (port 8000)
-./venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000
+# 3. The API server (port 8010)
+./venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8010
 
 # 4. In another terminal, the worker
 ./venv/bin/celery -A workers.celery_app worker --loglevel=info --pool=solo
@@ -340,7 +340,7 @@ every 60 seconds.
 Trigger a test incident:
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/alerts \
+curl -X POST http://localhost:8010/api/v1/alerts \
   -H 'Content-Type: application/json' \
   -d '{
     "receiver":"autofixops","status":"firing",
@@ -599,7 +599,7 @@ grep "TRACE:<incident_id>" celery.log
 - Check `tail -f api.log` — if you see `[INGEST] dropped duplicate`, the
   120s dedup window already covered it. Change one label or wait.
 - If you see no `[INGEST]` line at all, the request never reached the API.
-  Verify `curl http://localhost:8000/api/v1/status` returns JSON.
+  Verify `curl http://localhost:8010/api/v1/status` returns JSON.
 
 ### "An incident is stuck in `INGESTED`"
 - The Celery worker is not running, or not connected to the same Redis.

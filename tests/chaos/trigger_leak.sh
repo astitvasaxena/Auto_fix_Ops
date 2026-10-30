@@ -1,7 +1,7 @@
 #!/bin/bash
 # Trigger Memory Leak Chaos
 # Requires the target app to be exposed locally
-TARGET_URL=${1:-"http://localhost:8000"}
+TARGET_URL=${1:-"http://localhost:8001"}
 
 echo "🌊 Flooding memory at $TARGET_URL/leak ..."
 

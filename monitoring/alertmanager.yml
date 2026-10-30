@@ -15,6 +15,6 @@ route:
 receivers:
   - name: autofixops-webhook
     webhook_configs:
-      - url: 'http://host.docker.internal:8000/api/v1/alerts'
+      - url: 'http://host.docker.internal:8010/api/v1/alerts'
         send_resolved: true
         max_alerts: 10
