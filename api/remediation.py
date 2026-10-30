@@ -1,0 +1,156 @@
+"""
+Stages 3-4 API: human approval, GitHub PR, controlled deployment and recovery verification.
+
+Who may decide (approve / reject / close / advance):
+  - APPROVER_TOKENS="name:token,..." set  -> a request must send
+    "Authorization: Bearer <token>"; the matching name is recorded as the
+    authenticated approver identity.
+  - not set (local demonstration)         -> only requests from this machine
+    (loopback) are accepted, and they are recorded as authenticated=false with
+    no identity. Remote clients get 403.
+POSTs must be JSON (415 otherwise) so a cross-site page cannot submit them.
+The browser never sends a confidence, a value or a target: the proposal id it
+approves is checked against the latest validated proposal on the server.
+"""
+
+import hmac
+import os
+import uuid
+from typing import Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
+
+from api.database import SessionLocal, logger
+from api.patch_proposals import require_json
+from engine import remediation_workflow as wf
+
+router = APIRouter(prefix="/api/v1", tags=["remediation"])
+
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def get_session_factory():
+    return SessionLocal
+
+
+def _celery_dispatch(run_id: str):
+    from workers.tasks import advance_remediation
+
+    advance_remediation.apply_async(args=[run_id])
+
+
+def get_dispatcher():
+    return _celery_dispatch
+
+
+def _approver_tokens() -> dict:
+    tokens = {}
+    for item in (os.getenv("APPROVER_TOKENS") or "").split(","):
+        name, _, token = item.strip().partition(":")
+        if name and len(token) >= 16:
+            tokens[token] = name.strip()
+    return tokens
+
+
+def require_approver(request: Request) -> dict:
+    """The verified approver, or 401/403. Never invents an identity."""
+    tokens = _approver_tokens()
+    host = request.client.host if request.client else None
+    actor = {"client_host": host, "user_agent": request.headers.get("user-agent")}
+    if tokens:
+        header = request.headers.get("authorization", "")
+        supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        for token, name in tokens.items():
+            if supplied and hmac.compare_digest(supplied.encode(), token.encode()):
+                return {**actor, "authenticated": True, "identity": name, "source": "approver-token"}
+        raise HTTPException(status_code=401, detail="APPROVER_AUTH_REQUIRED: send Authorization: Bearer <approver token>")
+    if host not in LOOPBACK:
+        raise HTTPException(status_code=403, detail="LOCAL_ONLY: remote approvals require APPROVER_TOKENS to be configured")
+    return {**actor, "authenticated": False, "identity": None, "source": "local-dashboard"}
+
+
+class DecisionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    proposal_id: uuid.UUID
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class ReasonIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+def _http(exc: wf.WorkflowError) -> HTTPException:
+    return HTTPException(status_code=wf.HTTP_STATUS.get(exc.code, 409), detail=f"{exc.code}: {exc.detail}")
+
+
+def _view(session_factory, incident_id):
+    db = session_factory()
+    try:
+        return wf.remediation_view(db, incident_id)
+    except wf.WorkflowError as exc:
+        raise _http(exc)
+    finally:
+        db.close()
+
+
+@router.get("/incidents/{incident_id}/remediation")
+def get_remediation(incident_id: uuid.UUID, session_factory=Depends(get_session_factory)):
+    """Approval state, PR, deployment, verification and the incident timeline (read-only)."""
+    view = _view(session_factory, incident_id)
+    view["approver_auth"] = "token" if _approver_tokens() else "local-only"
+    return view
+
+
+@router.post("/incidents/{incident_id}/remediation/approve", dependencies=[Depends(require_json)])
+def approve_remediation(incident_id: uuid.UUID, body: DecisionIn, actor=Depends(require_approver),
+                        session_factory=Depends(get_session_factory), dispatch=Depends(get_dispatcher)):
+    try:
+        run, changed = wf.decide(session_factory, incident_id, body.proposal_id, wf.APPROVED, actor, body.reason)
+    except wf.WorkflowError as exc:
+        raise _http(exc)
+    dispatched = False
+    if changed:
+        try:
+            dispatch(run["id"])
+            dispatched = True
+        except Exception as exc:   # the run stays APPROVED; "advance" retries the step
+            logger.error(f"[TRACE:{incident_id}] remediation dispatch failed: {exc.__class__.__name__}")
+    return {"changed": changed, "dispatched": dispatched, "run": run, "view": _view(session_factory, incident_id)}
+
+
+@router.post("/incidents/{incident_id}/remediation/reject", dependencies=[Depends(require_json)])
+def reject_remediation(incident_id: uuid.UUID, body: DecisionIn, actor=Depends(require_approver),
+                       session_factory=Depends(get_session_factory)):
+    try:
+        run, changed = wf.decide(session_factory, incident_id, body.proposal_id, wf.REJECTED, actor, body.reason)
+    except wf.WorkflowError as exc:
+        raise _http(exc)
+    return {"changed": changed, "run": run, "view": _view(session_factory, incident_id)}
+
+
+@router.post("/incidents/{incident_id}/remediation/advance", dependencies=[Depends(require_json)])
+def advance_remediation(incident_id: uuid.UUID, actor=Depends(require_approver),
+                        session_factory=Depends(get_session_factory), dispatch=Depends(get_dispatcher)):
+    """Re-runs the current step (e.g. after configuring GitHub or deployment, or to re-check a PR)."""
+    view = _view(session_factory, incident_id)
+    run = view.get("run")
+    if not run or run["final"]:
+        raise HTTPException(status_code=409, detail="NOTHING_TO_ADVANCE: no active remediation run")
+    try:
+        dispatch(run["id"])
+    except Exception:
+        raise HTTPException(status_code=503, detail="DISPATCH_FAILED: the worker queue is unreachable")
+    return {"dispatched": True, "view": view}
+
+
+@router.post("/incidents/{incident_id}/close", dependencies=[Depends(require_json)])
+def close_incident(incident_id: uuid.UUID, body: ReasonIn, actor=Depends(require_approver),
+                   session_factory=Depends(get_session_factory)):
+    """A human closes the incident without automated remediation (recorded on the timeline)."""
+    try:
+        result = wf.close_incident(session_factory, incident_id, actor, body.reason)
+    except wf.WorkflowError as exc:
+        raise _http(exc)
+    return {**result, "view": _view(session_factory, incident_id)}

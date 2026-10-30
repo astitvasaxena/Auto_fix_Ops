@@ -780,3 +780,27 @@ def generate_patch_proposal(self, incident_id: str, decision_id: str, claim: str
     logger.info(f"[TRACE:{incident_id}] === [STAGE 2: PATCH PROPOSAL] DONE → {result.get('status')}"
                 f"/{result.get('reason_code')} (not applied) ===")
     return result
+
+
+# ════════════════════════════════════════════════════════════
+# STAGES 3-4: approved remediation (PR -> deployment -> verification)
+# ════════════════════════════════════════════════════════════
+
+def _schedule_remediation(run_id: str, delay_seconds: int):
+    advance_remediation.apply_async(args=[run_id], countdown=max(0, int(delay_seconds)))
+
+
+@celery_app.task(bind=True, max_retries=0, time_limit=900, soft_time_limit=840)
+def advance_remediation(self, run_id: str):
+    """Runs the next step of an approved remediation run. Each step re-checks its preconditions,
+    so duplicate or late deliveries are harmless; follow-up steps are scheduled by the workflow."""
+    from engine import remediation_workflow as wf
+
+    result = wf.advance(SessionLocal, uuid.UUID(str(run_id)), wf.default_deps(_schedule_remediation))
+    incident_id = result.get("incident_id")
+    logger.info(f"[TRACE:{incident_id}] [REMEDIATION] run {run_id} stage={result.get('stage')} "
+                f"blocked={result.get('blocked_code')}")
+    if incident_id:
+        emit_sync("incident.remediation", {"stage": result.get("stage"), "blocked_code": result.get("blocked_code")},
+                  incident_id)
+    return {"stage": result.get("stage"), "blocked_code": result.get("blocked_code")}
