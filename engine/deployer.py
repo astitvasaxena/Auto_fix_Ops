@@ -151,12 +151,15 @@ class CommandResult:
 def subprocess_runner(argv: List[str], timeout: int) -> CommandResult:
     """Runs kubectl without a shell. Timeouts and a missing binary become non-zero results."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, shell=False)
+        done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, shell=False)
         return CommandResult(done.returncode, done.stdout, done.stderr)
     except subprocess.TimeoutExpired:
         return CommandResult(124, "", f"timed out after {timeout}s")
     except FileNotFoundError:
         return CommandResult(127, "", "kubectl not found (check KUBECTL_PATH)")
+    except OSError as exc:
+        return CommandResult(126, "", f"kubectl could not be started: {exc.__class__.__name__}")
 
 
 class Kubectl:
@@ -197,7 +200,10 @@ class Kubectl:
         r = self._run(t.namespace, ["get", "pods", "--selector", label, "--output", "json"])
         if r.returncode != 0:
             raise DeployBlocked("CLUSTER_UNREACHABLE", (r.stderr or "kubectl get pods failed").strip()[:300])
-        return json.loads(r.stdout).get("items", [])
+        try:
+            return json.loads(r.stdout).get("items", [])
+        except (ValueError, AttributeError):
+            raise DeployBlocked("CLUSTER_UNREACHABLE", "kubectl returned invalid JSON for pods")
 
 
 # ─── Plan, apply, roll back ───
@@ -248,8 +254,14 @@ def apply_change(kube: Kubectl, t: Target) -> dict:
         raise DeployBlocked("DRY_RUN_REFUSED", (dry.stderr or "server-side dry run failed").strip()[:300])
     real = kube.json_patch(t, record["patch"], dry_run=False)
     if real.returncode != 0:
-        # The JSON patch is atomic on the API server: a refused patch changed nothing.
-        raise DeployBlocked("PATCH_REFUSED", (real.stderr or "kubectl patch failed").strip()[:300])
+        # The JSON patch is atomic on the API server, but a client timeout or a dropped connection
+        # can hide a patch that was applied. Re-read before calling it refused.
+        error = (real.stderr or "kubectl patch failed").strip()[:300]
+        after = live_limit(kube.get_deployment(t), index, t.resource)   # unreadable -> caller reconciles
+        if after == t.new_value:
+            record["patched"] = True
+            raise DeployFailed("PATCH_RESULT_UNCONFIRMED", error, applied=True, record=record)
+        raise DeployBlocked("PATCH_REFUSED", error)
     record["patched"] = True
     rollout = kube.rollout_status(t)
     record["rollout"] = {"returncode": rollout.returncode, "output": (rollout.stdout or rollout.stderr or "")[-MAX_OUTPUT:]}

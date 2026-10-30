@@ -473,8 +473,9 @@ def test_blocked_steps_change_nothing_and_can_resume():
     view = w.advance(run["id"])
     assert view["stage"] == wf.VERIFYING and w.kube.memory == w.new_value
     assert w.incident().status == IncidentStatus.REMEDIATING
-    w.clock.tick(10); w.advance(run["id"])
-    w.clock.tick(30); view = w.advance(run["id"])
+    for _ in range(3):
+        w.clock.tick(10); w.advance(run["id"])
+    w.clock.tick(10); view = w.advance(run["id"])
     assert view["stage"] == wf.RESOLVED and w.incident().status == IncidentStatus.RESOLVED
     print("✅ PASS: no GitHub / deploy disabled / not allowlisted / shadow → blocked, nothing changed; resumes later")
 
@@ -608,7 +609,7 @@ def _client(w, host="127.0.0.1"):
     app.dependency_overrides[api_module.get_session_factory] = lambda: w.SF
     dispatched = []
     app.dependency_overrides[api_module.get_dispatcher] = lambda: dispatched.append
-    return TestClient(app, client=(host, 50000)), dispatched
+    return TestClient(app, base_url="http://127.0.0.1:8010", client=(host, 50000)), dispatched
 
 
 def test_api_approver_auth_and_json_only():
@@ -647,6 +648,134 @@ def test_api_local_approval_is_recorded_unauthenticated():
     who = resp.json()["run"]["decided_by"]
     assert who["authenticated"] is False and who["identity"] is None and who["client_host"] == "127.0.0.1"
     print("✅ PASS: local demo approval is recorded as unauthenticated, with no invented identity")
+
+
+def test_api_local_mode_refuses_dns_rebinding():
+    w = World()
+    local, _ = _client(w)
+    url = f"/api/v1/incidents/{w.incident_id}/remediation/approve"
+    body = {"proposal_id": str(w.proposal_id)}
+    assert local.post(url, json=body, headers={"Host": "attacker.example:8010"}).status_code == 403
+    assert local.post(url, json=body, headers={"Origin": "http://attacker.example"}).status_code == 403
+    assert local.post(url, json=body, headers={"Origin": "http://localhost:3000"}).status_code == 200
+    print("✅ PASS: loopback-only mode also needs a local Host and the dashboard Origin (DNS rebinding)")
+
+
+# ─── Failure handling found by the independent review ───
+
+def _ready_to_deploy(w):
+    run, _ = w.approve()
+    w.advance(run["id"])
+    w.github.merge(1)
+    assert w.advance(run["id"])["stage"] == wf.READY_TO_DEPLOY
+    return run["id"]
+
+
+def test_crash_during_rollout_is_reconciled_and_rolled_back():
+    class CrashingKube(FakeKube):
+        def __call__(self, argv, timeout):
+            if argv[5:7] == ["rollout", "status"] and not getattr(self, "crashed", False):
+                self.crashed = True
+                raise UnicodeDecodeError("cp1252", b"\x81", 0, 1, "undefined")   # e.g. undecodable kubectl output
+            return super().__call__(argv, timeout)
+
+    w = World(kube=CrashingKube())
+    view = w.advance(_ready_to_deploy(w))
+    assert view["stage"] == wf.ROLLED_BACK, (view["stage"], view["blocked_code"])
+    assert w.kube.memory == "100Mi" and w.runs()[0].deploy_lock is None
+    assert w.incident().status == IncidentStatus.FAILED
+    print("✅ PASS: a crash after the patch is reconciled from the live state and rolled back; lock released")
+
+
+def test_run_left_in_deploying_is_recovered():
+    w = World()
+    run_id = _ready_to_deploy(w)
+    db = w.SF()
+    db.query(RemediationRun).update({"stage": wf.DEPLOYING, "deploy_lock": True})   # worker died mid-deploy
+    db.commit()
+    db.close()
+    view = w.advance(run_id)                               # live value unchanged -> safe to retry
+    assert view["stage"] == wf.READY_TO_DEPLOY and view["blocked_code"] == "DEPLOY_INTERRUPTED"
+    assert w.runs()[0].deploy_lock is None
+    assert w.advance(run_id)["stage"] == wf.VERIFYING
+    print("✅ PASS: a run stuck in DEPLOYING is reconciled instead of staying stuck")
+
+
+def test_patch_applied_despite_client_error_is_rolled_back():
+    class TimeoutAfterApplyKube(FakeKube):
+        def __call__(self, argv, timeout):
+            result = super().__call__(argv, timeout)
+            if argv[5] == "patch" and "--dry-run=server" not in argv and len(self.applied) == 1:
+                return dep.CommandResult(124, "", "timed out after 30s")   # applied, but the client gave up
+            return result
+
+    w = World(kube=TimeoutAfterApplyKube())
+    view = w.advance(_ready_to_deploy(w))
+    assert view["stage"] == wf.ROLLED_BACK and w.kube.memory == "100Mi", view["stage"]
+    print("✅ PASS: a patch hidden by a client timeout is detected by re-reading and rolled back")
+
+
+def test_unobserved_gap_does_not_count_as_stable():
+    w = World(env={"VERIFY_TIMEOUT_SECONDS": "300"})
+    run_id = w.to_verifying()
+    w.clock.tick(10)
+    assert w.advance(run_id)["verification"]["stable_since"]
+    w.clock.tick(100)                                      # nobody checked for 100s (worker/Redis down)
+    view = w.advance(run_id)
+    assert view["stage"] == wf.VERIFYING, "a gap must restart the stabilization window"
+    w.clock.tick(10); w.advance(run_id)
+    w.clock.tick(10); w.advance(run_id)
+    w.clock.tick(10)
+    assert w.advance(run_id)["stage"] == wf.RESOLVED
+    print("✅ PASS: time without observations never counts towards the stabilization window")
+
+
+def test_step_errors_and_kill_switch_keep_verification_scheduled():
+    w = World()
+    run_id = w.to_verifying()
+    w.scheduled.clear()
+    db = w.SF()
+    db.merge(SystemConfig(id="global", system_mode=SystemMode.DISABLED))
+    db.commit()
+    view = w.advance(run_id)
+    assert view["blocked_code"] == "SYSTEM_DISABLED" and w.scheduled, "verification must keep being scheduled"
+    db.merge(SystemConfig(id="global", system_mode=SystemMode.ACTIVE))
+    db.commit()
+    db.close()
+    w.scheduled.clear()
+    original = w.deps.prom_query
+    w.deps.prom_query = lambda q: (_ for _ in ()).throw(RuntimeError("boom"))
+    w.clock.tick(10)
+    view = w.advance(run_id)
+    assert view["stage"] == wf.VERIFYING and w.scheduled          # a failed round, not a stopped run
+    w.deps.prom_query = original
+    print("✅ PASS: kill switch and errors during verification never stop the scheduled checks")
+
+
+def test_incident_state_conflict_does_not_leave_the_run_claimed():
+    w = World()
+    run, _ = w.approve()
+    db = w.SF()
+    db.query(Incident).update({"status": IncidentStatus.FAILED})    # e.g. a stray legacy task
+    db.commit()
+    db.close()
+    view = w.advance(run["id"])
+    assert view["stage"] == wf.PR_OPEN and not view["step_in_progress"]
+    assert any(e["event"] == "INCIDENT_STATE_CONFLICT" for e in view["audit_log"])
+    print("✅ PASS: an incident moved elsewhere is recorded; the run outcome is kept and the claim cleared")
+
+
+def test_proposal_changed_after_approval_blocks_every_step():
+    w = World()
+    run, _ = w.approve()
+    from api.models import PatchProposal
+    db = w.SF()
+    db.query(PatchProposal).update({"unified_diff": "--- tampered\n"})
+    db.commit()
+    db.close()
+    view = w.advance(run["id"])
+    assert view["blocked_code"] == "PROPOSAL_CHANGED" and w.github.prs == []
+    print("✅ PASS: a proposal altered after approval blocks the run before any PR or deployment")
 
 
 if __name__ == "__main__":

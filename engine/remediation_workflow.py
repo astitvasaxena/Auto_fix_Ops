@@ -48,7 +48,17 @@ APPROVED, REJECTED, PR_OPEN, READY_TO_DEPLOY = "APPROVED", "REJECTED", "PR_OPEN"
 DEPLOYING, VERIFYING, RESOLVED = "DEPLOYING", "VERIFYING", "RESOLVED"
 FAILED, ROLLED_BACK, ROLLBACK_FAILED = "FAILED", "ROLLED_BACK", "ROLLBACK_FAILED"
 FINAL_STAGES = {REJECTED, RESOLVED, FAILED, ROLLED_BACK, ROLLBACK_FAILED}
-STEP_STALE_S = 900          # a claimed step older than this is assumed dead and may be re-claimed
+STEP_STALE_S = 900          # minimum age before a claimed step is assumed dead and may be re-claimed
+
+
+def step_stale_s(env) -> int:
+    """A claim may be taken over only after the longest possible step (deploy + failed rollout
+    + rollback rollout) has certainly ended, so two workers never run the same step."""
+    try:
+        rollout = int(env.get("DEPLOY_ROLLOUT_TIMEOUT_SECONDS", 120))
+    except (TypeError, ValueError):
+        rollout = 120
+    return max(STEP_STALE_S, 2 * (rollout + 15) + 300)
 MAX_ROUNDS_KEPT = 40
 MAX_AUDIT_EVENTS = 200
 
@@ -269,7 +279,7 @@ def close_incident(session_factory, incident_uuid, actor: dict, reason: Optional
 
 # ─── Steps ───
 
-def _claim(session_factory, run_uuid, now):
+def _claim(session_factory, run_uuid, now, stale_s=STEP_STALE_S):
     """Atomically claims the run's next step. Returns (run dict, token) or (run dict, None)."""
     from api.models import RemediationRun
 
@@ -280,7 +290,7 @@ def _claim(session_factory, run_uuid, now):
             raise WorkflowError("RUN_NOT_FOUND", "remediation run not found")
         if run.stage in FINAL_STAGES or run.stage == REJECTED:
             return serialise_run(run), None
-        stale = now - datetime.timedelta(seconds=STEP_STALE_S)
+        stale = now - datetime.timedelta(seconds=stale_s)
         if run.step_token and run.step_started_at and run.step_started_at > stale:
             return serialise_run(run), None
         token = uuid.uuid4().hex
@@ -332,7 +342,11 @@ def _finish(session_factory, run_uuid, token, outcome: Outcome, now) -> dict:
                 run.finished_at = now
                 run.deploy_lock = None
         if outcome.incident:
-            _move(incident, *outcome.incident)
+            try:
+                _move(incident, *outcome.incident)
+            except ValueError as exc:   # the incident was moved elsewhere: record, never lose the run outcome
+                events.append(_event("INCIDENT_STATE_CONFLICT", now, wanted=list(outcome.incident),
+                                     detail=str(exc)[:300]))
         if outcome.note:
             _note_timeline(incident, outcome.note)
         run.audit_log = _append(run.audit_log, *events)
@@ -367,12 +381,14 @@ def _set_stage_now(session_factory, run_uuid, token, stage, now, **updates):
     db = session_factory()
     try:
         run = db.query(RemediationRun).filter(RemediationRun.id == run_uuid, RemediationRun.step_token == token).first()
-        if run is not None:
-            run.audit_log = _append(run.audit_log, _event("STAGE", now, frm=run.stage, to=stage))
-            run.stage, run.updated_at = stage, now
-            for key, value in updates.items():
-                setattr(run, key, value)
-            db.commit()
+        if run is None:
+            return False
+        run.audit_log = _append(run.audit_log, _event("STAGE", now, frm=run.stage, to=stage))
+        run.stage, run.updated_at = stage, now
+        for key, value in updates.items():
+            setattr(run, key, value)
+        db.commit()
+        return True
     finally:
         db.close()
 
@@ -394,24 +410,43 @@ def _load_context(session_factory, run_uuid):
         db.close()
 
 
+def _approved_proposal_problem(run, proposal) -> Optional[str]:
+    """Every step re-checks that the stored proposal is still the intact one that was approved."""
+    from engine.patch_proposer import effective_status
+
+    if proposal is None:
+        return "the approved proposal no longer exists"
+    status, reason = effective_status(proposal)
+    if status != VALIDATED:
+        return f"the approved proposal is now {status} ({reason})"
+    if proposal.diff_sha256 != run.diff_sha256:
+        return "the stored diff differs from the one that was approved"
+    return None
+
+
 def advance(session_factory, run_uuid, deps: Deps) -> dict:
     """Runs the next step of a remediation run (idempotent; safe to call repeatedly)."""
     now = deps.now()
-    run_view, token = _claim(session_factory, run_uuid, now)
+    run_view, token = _claim(session_factory, run_uuid, now, step_stale_s(deps.env))
     if token is None:
         return run_view
     run, proposal, snap = _load_context(session_factory, run_uuid)
+    # Stages that must keep being checked even while blocked (a change may be live in the cluster).
+    keep_polling = {PR_OPEN: _pr_poll_s(deps), DEPLOYING: 30, VERIFYING: 30}.get(run.stage)
     try:
-        if snap["system_mode"] == "DISABLED":
-            outcome = Outcome(blocked=("SYSTEM_DISABLED", "kill switch is DISABLED"))
+        problem = _approved_proposal_problem(run, proposal)
+        if problem:
+            outcome = Outcome(blocked=("PROPOSAL_CHANGED", problem), next_in=keep_polling)
+        elif snap["system_mode"] == "DISABLED":
+            outcome = Outcome(blocked=("SYSTEM_DISABLED", "kill switch is DISABLED"), next_in=keep_polling)
         else:
             step = {APPROVED: _publish_pr, PR_OPEN: _check_pr, READY_TO_DEPLOY: _deploy,
-                    VERIFYING: _verify_round}.get(run.stage)
+                    DEPLOYING: _recover_deploying, VERIFYING: _verify_round}.get(run.stage)
             outcome = (step(session_factory, run, proposal, snap, deps, token, now) if step
                        else Outcome(blocked=("NOTHING_TO_DO", f"stage {run.stage} has no step")))
-    except Exception as exc:   # never leave a claim behind
+    except Exception as exc:   # never leave a claim behind; keep checking stages with live changes
         logger.exception(f"[REMEDIATION] run {run_uuid} step {run.stage} crashed")
-        outcome = Outcome(blocked=("STEP_ERROR", f"{exc.__class__.__name__}: {exc}"))
+        outcome = Outcome(blocked=("STEP_ERROR", f"{exc.__class__.__name__}: {exc}"), next_in=keep_polling)
     result = _finish(session_factory, run_uuid, token, outcome, deps.now())
     if outcome.next_in is not None and deps.schedule:
         deps.schedule(str(run_uuid), outcome.next_in)
@@ -543,7 +578,9 @@ def _deploy(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
         return Outcome(blocked=(exc.code, exc.detail))
     if not _set_lock(session_factory, run.id, True):
         return Outcome(blocked=("TARGET_BUSY", f"another remediation is deploying to {target.key}"), next_in=30)
-    _set_stage_now(session_factory, run.id, token, DEPLOYING, now)
+    if not _set_stage_now(session_factory, run.id, token, DEPLOYING, now):
+        _set_lock(session_factory, run.id, None)   # another worker took the step over
+        return Outcome()
     kube = dep.Kubectl(cfg, deps.kube_runner)
     deployment = {"mode": "kubectl", "context": cfg.context, "target": target.key, "container": target.container,
                   "resource": target.resource, "from": target.old_value, "to": target.new_value,
@@ -563,6 +600,10 @@ def _deploy(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
         deployment.update(exc.record, error=exc.code, detail=exc.detail, commands=kube.commands)
         return _rollback(session_factory, run, proposal, snap, deps, kube, target,
                          exc.record["previous"]["container"]["index"], deployment, None, f"rollout failed: {exc.detail}")
+    except Exception as exc:           # crash/timeout mid-step: decide from the live cluster state
+        deployment.update(commands=kube.commands)
+        return _reconcile(session_factory, run, proposal, snap, deps, kube, target, deployment,
+                          f"deploy step interrupted ({exc.__class__.__name__})")
     deployment.update(record, finished_at=_iso(deps.now()), commands=kube.commands)
     verification = {"started_at": _iso(deps.now()), "stable_since": None, "rounds": [], "baseline_restarts": None,
                     "interval_s": vcfg.interval_s, "stabilization_s": vcfg.stabilization_s, "timeout_s": vcfg.timeout_s}
@@ -570,6 +611,42 @@ def _deploy(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
                    events=[_event("DEPLOYED", deps.now(), target=target.key, value=target.new_value)],
                    note=f"deployed {target.resource} limit {target.old_value} -> {target.new_value} to {target.key}",
                    next_in=vcfg.interval_s)
+
+
+def _reconcile(session_factory, run, proposal, snap, deps, kube, target, deployment, why) -> Outcome:
+    """The deploy step ended without a clear result. Reads the live limit and either rolls the
+    change back (it is live but its rollout was never confirmed), returns to READY_TO_DEPLOY
+    (nothing changed), or fails (someone else changed it). While the cluster cannot be read the
+    run stays DEPLOYING, keeps the target lock and is checked again."""
+    try:
+        live = kube.get_deployment(target)
+        index = dep.container_index(live, target.container)
+        value = dep.live_limit(live, index, target.resource)
+    except Exception as exc:
+        return Outcome(stage=DEPLOYING, updates={"deployment": deployment}, next_in=30,
+                       blocked=("DEPLOY_STATE_UNKNOWN", f"{why}; live state unreadable ({exc.__class__.__name__})"))
+    if value == target.new_value:
+        return _rollback(session_factory, run, proposal, snap, deps, kube, target, index, deployment, None,
+                         f"{why}; the change is live but its rollout was not confirmed")
+    if value == target.old_value:
+        _set_lock(session_factory, run.id, None)
+        return Outcome(stage=READY_TO_DEPLOY, updates={"deployment": deployment},
+                       blocked=("DEPLOY_INTERRUPTED", f"{why}; the live value is unchanged, safe to retry"))
+    return Outcome(stage=FAILED, updates={"deployment": deployment}, incident=("FAILED",),
+                   events=[_event("DRIFT_DETECTED", deps.now(), live=str(value))],
+                   note=f"{why}; live {target.resource} limit is {value}, changed by someone else - manual review needed")
+
+
+def _recover_deploying(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
+    """A run found in DEPLOYING was interrupted (worker crash or stale claim)."""
+    try:
+        cfg = dep.deploy_config(deps.env)
+        target = _target(proposal)
+    except dep.DeployBlocked as exc:
+        return Outcome(blocked=(exc.code, exc.detail), next_in=60)
+    kube = dep.Kubectl(cfg, deps.kube_runner)
+    return _reconcile(session_factory, run, proposal, snap, deps, kube, target, dict(run.deployment or {}),
+                      "previous deploy step did not finish")
 
 
 def _parse(ts: Optional[str]):
@@ -593,6 +670,10 @@ def _verify_round(session_factory, run, proposal, snap, deps, token, now) -> Out
     verification["rounds"] = rounds[-MAX_ROUNDS_KEPT:]
     verification["round_count"] = int(verification.get("round_count") or 0) + 1
     started = _parse(verification.get("started_at")) or now
+    last = _parse(verification.get("last_round_at"))
+    verification["last_round_at"] = _iso(now)
+    if last is not None and (now - last).total_seconds() > 2 * vcfg.interval_s:
+        verification["stable_since"] = None   # unobserved time never counts as stable
     if result["ok"]:
         stable_since = _parse(verification.get("stable_since")) or now
         verification["stable_since"] = _iso(stable_since)
@@ -644,6 +725,8 @@ def _revert_pr(run, proposal, snap, deps) -> dict:
         base_branch = gateway.default_branch()
         head = gateway.branch_head(base_branch)
         original, _ = gateway.get_file(proposal.target_file, github["base_commit_sha"])
+        if git_blob_sha(original.replace(b"\r\n", b"\n")) != (proposal.base or {}).get("git_blob_sha"):
+            return {"created": False, "reason": "recorded base commit does not hold the original manifest; revert manually"}
         _, current_blob = gateway.get_file(proposal.target_file, head)
         gateway.create_branch(branch, head)
         gateway.put_file(proposal.target_file, original, current_blob, branch,

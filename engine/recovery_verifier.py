@@ -55,7 +55,7 @@ def verify_config(env=None) -> VerifyConfig:
     if not re.match(r"^https?://[A-Za-z0-9.\-:\[\]]+(/[A-Za-z0-9._~/\-]*)?$", url):
         raise DeployBlocked("VERIFY_CONFIG_INVALID", "VERIFY_HEALTH_URL must be an http(s) URL of the target's health endpoint")
     cfg = VerifyConfig(health_url=url, interval_s=number("VERIFY_INTERVAL_SECONDS", 10, 2, 300),
-                       stabilization_s=number("VERIFY_STABILIZATION_SECONDS", 60, 0, 3600),
+                       stabilization_s=number("VERIFY_STABILIZATION_SECONDS", 60, 10, 3600),
                        timeout_s=number("VERIFY_TIMEOUT_SECONDS", 300, 30, 7200))
     if cfg.timeout_s <= cfg.stabilization_s:
         raise DeployBlocked("VERIFY_CONFIG_INVALID", "VERIFY_TIMEOUT_SECONDS must exceed VERIFY_STABILIZATION_SECONDS")
@@ -114,6 +114,8 @@ def run_round(kube: Kubectl, t: Target, cfg: VerifyConfig, alert_name: str,
         checks.append(_check("pods_healthy", not problems, "; ".join(problems) or f"{len(pods)} pod(s) running and ready"))
     except DeployBlocked as exc:
         checks.append(_check("deployment_ready", False, f"{exc.code}: {exc.detail}"))
+    except Exception as exc:   # unexpected kubectl output never crashes a round; it fails it
+        checks.append(_check("deployment_ready", False, f"cluster state unreadable: {exc.__class__.__name__}"))
 
     try:
         code = http_get(cfg.health_url)

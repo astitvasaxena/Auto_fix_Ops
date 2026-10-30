@@ -28,6 +28,7 @@ from engine import remediation_workflow as wf
 router = APIRouter(prefix="/api/v1", tags=["remediation"])
 
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+LOCAL_ORIGINS = {"http://localhost:3000", "http://127.0.0.1:3000"}   # the dashboard (same as the CORS allowlist)
 
 
 def get_session_factory():
@@ -67,6 +68,12 @@ def require_approver(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="APPROVER_AUTH_REQUIRED: send Authorization: Bearer <approver token>")
     if host not in LOOPBACK:
         raise HTTPException(status_code=403, detail="LOCAL_ONLY: remote approvals require APPROVER_TOKENS to be configured")
+    # A loopback source address is not enough: a DNS-rebinding page in the operator's browser also
+    # arrives from 127.0.0.1. Require a local Host header and, if sent, a dashboard Origin.
+    hostname = (request.headers.get("host") or "").rsplit(":", 1)[0].strip("[]").lower()
+    origin = request.headers.get("origin")
+    if hostname not in LOOPBACK or (origin and origin not in LOCAL_ORIGINS):
+        raise HTTPException(status_code=403, detail="LOCAL_ONLY: request must target localhost from the local dashboard")
     return {**actor, "authenticated": False, "identity": None, "source": "local-dashboard"}
 
 
