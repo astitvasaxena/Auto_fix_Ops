@@ -77,6 +77,12 @@ _CLOSED_STATUSES = [
 ]
 
 
+def _incident_source(incident) -> str:
+    """How the incident was created: "chaos_injection" (POST /chaos/inject creates it directly,
+    without Prometheus/Alertmanager) or "alertmanager" (webhook from a firing alert rule)."""
+    return "chaos_injection" if (incident.raw_payload_cache or {}).get("chaos") else "alertmanager"
+
+
 def generate_dedup_key(alert: dict, window_seconds: int = 120) -> str:
     """Generates a time-bucketed deduplication fingerprint."""
     labels = alert.get("labels", {})
@@ -222,6 +228,8 @@ def list_incidents(
                 "diagnosed_by": i.diagnosed_by,
                 "created_at": i.created_at.isoformat() if i.created_at else None,
                 "resolved_at": i.resolved_at.isoformat() if i.resolved_at else None,
+                "source": _incident_source(i),
+                "status_timeline": i.status_timeline or [],
             }
             for i in incidents
         ],
@@ -233,10 +241,11 @@ def list_incidents(
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/incidents/{incident_id}/context")
-def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
+def get_incident_context(incident_id: uuid.UUID, db: Session = Depends(get_db)):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)
 
     # Fetch MongoDB context
     mongo_ctx = incident_contexts_collection.find_one(
@@ -246,7 +255,7 @@ def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
     # Fetch remediation audits
     audits = (
         db.query(RemediationAudit)
-        .filter(RemediationAudit.incident_id == incident_id)
+        .filter(RemediationAudit.incident_id == incident.id)
         .all()
     )
 
@@ -264,6 +273,9 @@ def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
             "policy_decision": (incident.raw_payload_cache or {}).get("policy_decision"),
             "resolved_target": incident.resolved_target,
             "created_at": incident.created_at.isoformat() if incident.created_at else None,
+            "resolved_at": incident.resolved_at.isoformat() if incident.resolved_at else None,
+            "source": _incident_source(incident),
+            "status_timeline": incident.status_timeline or [],
         },
         "telemetry_context": mongo_ctx,
         "remediation_audits": [
@@ -288,15 +300,26 @@ def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/escalations/{incident_id}/approve")
-def approve_escalation(incident_id: str, db: Session = Depends(get_db)):
+def approve_escalation(incident_id: uuid.UUID, db: Session = Depends(get_db)):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)
 
     if incident.status != IncidentStatus.ESCALATED:
         raise HTTPException(
             status_code=409,
             detail=f"Incident is in state {incident.status.value}, not ESCALATED.",
+        )
+
+    # An incident escalated by a Stage 3 rejection must not be remediated through this legacy,
+    # unvalidated path; it can only be closed by a human (POST /api/v1/incidents/{id}/close).
+    from .models import RemediationRun
+    if db.query(RemediationRun).filter(RemediationRun.incident_id == incident.id).first():
+        raise HTTPException(
+            status_code=409,
+            detail="REMEDIATION_REJECTED: a human rejected this incident's validated proposal; "
+                   "close the incident instead of using the legacy escalation path.",
         )
 
     # Build verdict from stored diagnosis

@@ -538,6 +538,33 @@ def test_reject_and_manual_close():
     print("✅ PASS: rejection needs a reason, creates no PR; manual close is recorded")
 
 
+def test_legacy_escalation_path_refused_after_rejection():
+    from api.database import get_db
+    from api.main import app as real_app
+
+    w = World()
+    wf.decide(w.SF, w.incident_id, w.proposal_id, wf.REJECTED, ACTOR, "not this fix")
+    assert w.incident().status == IncidentStatus.ESCALATED
+
+    def _get_db():
+        db = w.SF()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    real_app.dependency_overrides[get_db] = _get_db
+    try:
+        resp = TestClient(real_app).post(f"/api/v1/escalations/{w.incident_id}/approve")
+        assert resp.status_code == 409 and "REMEDIATION_REJECTED" in resp.text, resp.text
+        ctx = TestClient(real_app).get(f"/api/v1/incidents/{w.incident_id}/context").json()["incident"]
+        assert ctx["source"] == "alertmanager" and [e["status"] for e in ctx["status_timeline"]][-1] == "ESCALATED"
+    finally:
+        real_app.dependency_overrides.pop(get_db, None)
+    assert w.incident().status == IncidentStatus.ESCALATED
+    print("✅ PASS: a rejected remediation cannot be pushed through the legacy escalation path")
+
+
 def test_kubectl_arguments_are_fixed_and_validated():
     for bad in ({"namespace": "autofixops; rm -rf /"}, {"container": "$(whoami)"}, {"name": "a b"}):
         ref = {"kind": "Deployment", "namespace": "autofixops", "name": "autofixops-target-app",

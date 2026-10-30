@@ -4,57 +4,8 @@ import { useParams, useRouter } from 'next/navigation';
 import { api } from '../../../lib/api';
 import { formatConfidence } from '../../../lib/remediation.mjs';
 import AIRemediationPanel from '../../../components/AIRemediationPanel';
-
-const PIPELINE_STAGES = [
-  { key: 'INGESTED', label: 'Ingest', icon: '📥' },
-  { key: 'CONTEXT_BUILT', label: 'Context', icon: '🔍' },
-  { key: 'DIAGNOSED', label: 'Diagnosis', icon: '🧠' },
-  { key: 'POLICY_APPROVED', label: 'Policy', icon: '🛡' },
-  { key: 'PENDING_PR_MERGE', label: 'PR', icon: '🔧' },
-  { key: 'VERIFIED', label: 'Verify', icon: '✅' },
-  { key: 'RESOLVED', label: 'Resolved', icon: '🎯' },
-];
-
-const STATUS_ORDER = {
-  INGESTED: 0, CONTEXT_BUILT: 1, DIAGNOSED: 2, POLICY_APPROVED: 3,
-  REMEDIATING: 3.5, PENDING_PR_MERGE: 4, VERIFIED: 5, RESOLVED: 6,
-  FAILED: -1, ESCALATED: -2,
-};
-
-function PipelineFlow({ status }) {
-  const currentIdx = STATUS_ORDER[status] ?? -1;
-  const isFailed = status === 'FAILED';
-  const isEscalated = status === 'ESCALATED';
-
-  return (
-    <div className="pipeline-flow">
-      {PIPELINE_STAGES.map((stage, i) => {
-        let nodeClass = '';
-        let labelClass = '';
-        if (isFailed || isEscalated) {
-          nodeClass = i <= Math.abs(currentIdx) ? 'failed' : '';
-          labelClass = i <= Math.abs(currentIdx) ? 'failed' : '';
-        } else if (i < currentIdx) {
-          nodeClass = 'completed';
-          labelClass = 'completed';
-        } else if (i === Math.floor(currentIdx)) {
-          nodeClass = 'active';
-          labelClass = 'active';
-        }
-
-        return (
-          <div key={stage.key} style={{ display: 'flex', alignItems: 'center' }}>
-            {i > 0 && <div className={`pipeline-connector ${i <= currentIdx ? 'completed' : ''}`} />}
-            <div className="pipeline-step">
-              <div className={`pipeline-node ${nodeClass}`}>{stage.icon}</div>
-              <div className={`pipeline-label ${labelClass}`}>{stage.label}</div>
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+import RemediationPanel from '../../../components/RemediationPanel';
+import PipelineFlow from '../../../components/PipelineFlow';
 
 const PROVIDER_LABELS = { ollama: 'Ollama', openai: 'OpenAI' };
 // Older stored reports cite the retired synthetic runbooks; label them as such.
@@ -213,6 +164,7 @@ export default function IncidentDetailPage() {
   const [rollingBack, setRollingBack] = useState(false);
   const [toast, setToast] = useState(null);
   const [eventCount, setEventCount] = useState(0);
+  const [remediation, setRemediation] = useState(null);   // Stages 3-4 view (setter is stable)
 
   useEffect(() => {
     const load = () => {
@@ -277,9 +229,9 @@ export default function IncidentDetailPage() {
         </span>
       </div>
 
-      {/* Pipeline Flow */}
-      <div className="card mb-16">
-        <PipelineFlow status={incident.status} />
+      {/* Pipeline Flow: stages are completed only when the backend has recorded them */}
+      <div className="mb-16">
+        <PipelineFlow incident={incident} run={remediation?.run} />
       </div>
 
       {/* AI Incident Analysis (stored ai_report; display only) */}
@@ -288,6 +240,11 @@ export default function IncidentDetailPage() {
       {/* Stage 2: confidence-routed AI patch proposal (proposal only, never applied) */}
       {incident.ai_report && (
         <AIRemediationPanel incidentId={incident.id} report={incident.ai_report} refreshKey={eventCount} />
+      )}
+
+      {/* Stages 3-4: human approval -> GitHub PR -> controlled deployment -> recovery verification */}
+      {incident.ai_report && (
+        <RemediationPanel incidentId={incident.id} refreshKey={eventCount} onChange={setRemediation} />
       )}
 
       {/* Main Grid */}
@@ -504,7 +461,8 @@ export default function IncidentDetailPage() {
       )}
 
       {/* Escalation Approval */}
-      {incident.status === 'ESCALATED' && (
+      {/* Legacy escalation path; not offered after a Stage 3 rejection (the API refuses it too). */}
+      {incident.status === 'ESCALATED' && !remediation?.run && (
         <div className="card mt-16" style={{ borderColor: 'var(--warning)' }}>
           <h3 style={{ color: 'var(--warning)', marginBottom: 8 }}>⚠️ Human Approval Required</h3>
           <p className="text-sm text-muted mb-16">

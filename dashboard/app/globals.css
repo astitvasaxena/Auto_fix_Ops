@@ -358,7 +358,8 @@ body {
 
 .form-group input,
 .form-group select,
-.form-group textarea {
+.form-group textarea,
+.input {
   width: 100%;
   padding: 10px 14px;
   background: var(--bg-primary);
@@ -371,7 +372,8 @@ body {
 }
 
 .form-group input:focus,
-.form-group select:focus {
+.form-group select:focus,
+.input:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-glow);
@@ -735,6 +737,7 @@ body {
 .flow-node.completed { border-color: rgba(16,185,129,0.4); color: var(--success); }
 .flow-node.warning { border-color: rgba(245,158,11,0.5); color: var(--warning); }
 .flow-node.failed { border-color: rgba(239,68,68,0.5); color: var(--error); }
+.flow-node.skipped { border-style: dashed; opacity: 0.55; }
 .flow-node.active {
   border-color: var(--accent); color: var(--vanilla);
   background: linear-gradient(160deg, rgba(252,108,38,0.22), var(--bg-secondary));
