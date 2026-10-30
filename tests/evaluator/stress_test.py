@@ -2,7 +2,7 @@ import asyncio
 import httpx
 import time
 
-API_URL = "http://127.0.0.1:8000/api/v1/alerts"
+API_URL = "http://127.0.0.1:8010/api/v1/alerts"
 
 async def send_duplicate_alerts(count=50):
     """

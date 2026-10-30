@@ -13,12 +13,12 @@ Config comes from `.env` (see `.env.example`; loaded via `python-dotenv` in `api
 ```bash
 docker compose up -d                 # redis, postgres (host port 5433), prometheus (9090), alertmanager (9093)
 python scripts/migrate_schema.py     # idempotent ALTER TABLE ... ADD COLUMN IF NOT EXISTS
-uvicorn api.main:app --host 0.0.0.0 --port 8000
+uvicorn api.main:app --host 0.0.0.0 --port 8010
 celery -A workers.celery_app worker --loglevel=info --pool=solo   # --pool=solo needed on Windows
 cd dashboard && npm install && npm run dev                         # Next.js on :3000, API via NEXT_PUBLIC_API_URL
 ```
 
-Chaos target app (the thing being monitored): `kubernetes_integration/target_app/app.py` — Prometheus in docker-compose scrapes it at `host.docker.internal:8001`, and Alertmanager posts to `host.docker.internal:8000/api/v1/alerts`. Alert rules live in `monitoring/alert_rules.yml`.
+Chaos target app (the thing being monitored): `kubernetes_integration/target_app/app.py` — Prometheus in docker-compose scrapes it at `host.docker.internal:8001`, and Alertmanager posts to `host.docker.internal:8010/api/v1/alerts`. Alert rules live in `monitoring/alert_rules.yml`.
 
 ## Tests
 

@@ -12,7 +12,7 @@ import time
 import sys
 import os
 
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000/api/v1/alerts")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8010/api/v1/alerts")
 
 
 async def fire_alert_storm(count=100):
@@ -73,7 +73,7 @@ async def fire_alert_storm(count=100):
     # Check escalation rate hasn't spiked
     try:
         async with httpx.AsyncClient() as client:
-            metrics_resp = await client.get("http://127.0.0.1:8000/api/v1/metrics")
+            metrics_resp = await client.get("http://127.0.0.1:8010/api/v1/metrics")
             if metrics_resp.status_code == 200:
                 metrics = metrics_resp.json().get("all_time", {})
                 print(f"\n📊 Post-storm metrics:")

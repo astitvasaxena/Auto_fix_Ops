@@ -1,6 +1,6 @@
 #!/bin/bash
 # Trigger CPU Spike Chaos
-TARGET_URL=${1:-"http://localhost:8000"}
+TARGET_URL=${1:-"http://localhost:8001"}
 
 echo "🔥 Igniting CPU at $TARGET_URL/cpu ..."
 echo "Note: This is an infinite loop inside the pod. It will hang curl."
