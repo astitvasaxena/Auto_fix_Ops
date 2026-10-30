@@ -177,6 +177,13 @@ recommendations can avoid it.
 - Prometheus is the only telemetry source. Datadog / New Relic /
   CloudWatch are not built in.
 - The LLM call costs go to whatever provider you point `OPENAI_API_BASE` at.
+- **Local demonstration only: the API has no authentication or authorization.**
+  Anyone who can reach the API can approve or reject AI patch generation
+  (Stage 2), approve escalations and change the kill switch. Stage 2
+  approvals are recorded as `authenticated: false` with the client address
+  and user agent only — no user identity is invented. Run the API on
+  `localhost` or a private network, and **do not deploy it publicly** until
+  authentication and role-based authorization are added.
 
 ---
 
@@ -398,6 +405,29 @@ The **Rollback** button takes the `previous_values` recorded at fix
 time and creates a *second* PR that reverts only those exact fields.
 Same review-and-merge flow.
 
+**AI Remediation panel (Stage 2 — proposal only).** For an incident
+diagnosed by the AI analyst, the backend routes AI patch generation by the
+stored diagnosis confidence (one fixed threshold of **0.80**):
+
+| Confidence | Route | What happens |
+|---|---|---|
+| ≥ 0.80 (e.g. 0.8000, 0.8001) | `AUTOMATIC_AI` | A proposal is generated without asking. |
+| < 0.80 (e.g. 0.7999) | `HUMAN_APPROVAL_REQUIRED` | Nothing is generated until someone clicks **Approve AI Patch Generation**; **Reject Recommendation** means never for that diagnosis. |
+
+Both routes run the same proposer: the local model may only pick a value
+from a code-generated menu (or decline), and Python builds the diff and
+validates it in a temporary sandbox. Only a `VALIDATED` proposal shows a
+diff. Nothing is applied, committed, pushed or deployed — that is Stage 3.
+The model is consulted at most once per diagnosis version on every path
+(worker, API retry, CLI): once it has decided (`VALIDATED`, `REJECTED` or a
+decline), later runs return `ALREADY_GENERATED`. A `FAILED` run, a refusal
+caused by the kill switch or configuration, or a queued job that went stale
+can be retried; a new diagnosis is a new version.
+A `PATCH_PROPOSAL_MIN_CONFIDENCE` or project `confidence_threshold` other
+than 0.80 is refused as `CONFIG_INVALID`. Set `PATCH_PROPOSALS_AUTO=false`
+to stop automatic generation (the panel then shows a Generate button).
+Approvals are unauthenticated — see the local-demo limitation in section 5.
+
 ### `/metrics` — pipeline health
 - **Cards:** total incidents, resolved, escalated, failed.
 - **Engine split** (pie chart) — how many were caught by the rule
@@ -458,6 +488,18 @@ GET /api/v1/incidents/{incident_id}/context
 POST /api/v1/escalations/{incident_id}/approve
 # Resumes the pipeline at REMEDIATION.
 ```
+
+### AI patch proposals (Stage 2 — proposal only, never applied)
+```bash
+GET  /api/v1/incidents/{incident_id}/patch-proposals          # route, decision, latest proposal (read-only)
+POST /api/v1/incidents/{incident_id}/patch-proposals          # start (automatic route or approved); idempotent
+POST /api/v1/incidents/{incident_id}/patch-proposals/approve  # low-confidence route only
+POST /api/v1/incidents/{incident_id}/patch-proposals/reject
+GET  /api/v1/patch-proposals/{proposal_id}                    # also /diff and /validation
+# POST bodies must be JSON (Content-Type: application/json); confidence/route fields are refused (422).
+# No authentication: local demonstration only — do not expose publicly without authN/authZ.
+```
+CLI: `python scripts/propose_patch.py <incident_id>` and `--show <incident_id>`.
 
 ### Roll back a fix
 ```bash

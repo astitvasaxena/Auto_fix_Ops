@@ -2,6 +2,8 @@
 import { useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '../../../lib/api';
+import { formatConfidence } from '../../../lib/remediation.mjs';
+import AIRemediationPanel from '../../../components/AIRemediationPanel';
 
 const PIPELINE_STAGES = [
   { key: 'INGESTED', label: 'Ingest', icon: '📥' },
@@ -109,7 +111,7 @@ function AIReportCard({ report }) {
         <div>
           <div style={{ display: 'flex', justifyContent: 'space-between', ...SECTION_LABEL }}>
             <span>Confidence</span>
-            <span className="mono">{(confidence * 100).toFixed(0)}%</span>
+            <span className="mono">{formatConfidence(confidence)}</span>
           </div>
           <div style={{ height: 6, background: 'var(--bg-primary)', borderRadius: 3, overflow: 'hidden' }}>
             <div style={{
@@ -210,6 +212,7 @@ export default function IncidentDetailPage() {
   const [approving, setApproving] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [toast, setToast] = useState(null);
+  const [eventCount, setEventCount] = useState(0);
 
   useEffect(() => {
     const load = () => {
@@ -222,6 +225,7 @@ export default function IncidentDetailPage() {
     const cleanup = api.listenEvents((event) => {
       if (event.incident_id === id) {
         load();
+        setEventCount((n) => n + 1);
       }
     });
     return cleanup;
@@ -281,6 +285,11 @@ export default function IncidentDetailPage() {
       {/* AI Incident Analysis (stored ai_report; display only) */}
       {incident.ai_report && <AIReportCard report={incident.ai_report} />}
 
+      {/* Stage 2: confidence-routed AI patch proposal (proposal only, never applied) */}
+      {incident.ai_report && (
+        <AIRemediationPanel incidentId={incident.id} report={incident.ai_report} refreshKey={eventCount} />
+      )}
+
       {/* Main Grid */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         {/* Diagnosis */}
@@ -297,7 +306,7 @@ export default function IncidentDetailPage() {
             <div style={{ marginBottom: 12 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
                 <span>Confidence</span>
-                <span className="mono">{(incident.confidence * 100).toFixed(0)}%</span>
+                <span className="mono">{formatConfidence(incident.confidence)}</span>
               </div>
               <div style={{ height: 6, background: 'var(--bg-primary)', borderRadius: 3, overflow: 'hidden' }}>
                 <div style={{
@@ -434,7 +443,7 @@ export default function IncidentDetailPage() {
           <div className="policy-grid">
             <div className="policy-gate">
               <span className="gate-icon">{incident.confidence >= 0.8 ? '✅' : '❌'}</span>
-              Confidence: {incident.confidence != null ? `${(incident.confidence * 100).toFixed(0)}%` : '—'} (≥80%)
+              Confidence: {incident.confidence != null ? formatConfidence(incident.confidence) : '—'} (≥80%)
             </div>
             <div className="policy-gate">
               <span className="gate-icon">✅</span>

@@ -33,6 +33,19 @@ export const api = {
   approveEscalation: (id) => fetchAPI(`/api/v1/escalations/${id}/approve`, { method: 'POST' }),
   rollbackIncident: (id) => fetchAPI(`/api/v1/incidents/${id}/rollback`, { method: 'POST' }),
 
+  // Stage 2: AI patch proposals (proposal only — there is deliberately no apply/deploy call).
+  // Requests never carry a confidence or route; the backend computes both from the stored report.
+  getPatchProposals: (id) => fetchAPI(`/api/v1/incidents/${id}/patch-proposals`),
+  startPatchProposal: (id, retry = false) => fetchAPI(`/api/v1/incidents/${id}/patch-proposals`, {
+    method: 'POST', body: JSON.stringify({ retry })
+  }),
+  approvePatchGeneration: (id, reason) => fetchAPI(`/api/v1/incidents/${id}/patch-proposals/approve`, {
+    method: 'POST', body: JSON.stringify({ reason: reason || null })
+  }),
+  rejectPatchGeneration: (id, reason) => fetchAPI(`/api/v1/incidents/${id}/patch-proposals/reject`, {
+    method: 'POST', body: JSON.stringify({ reason: reason || null })
+  }),
+
   // Metrics
   getMetrics: () => fetchAPI('/api/v1/metrics'),
 

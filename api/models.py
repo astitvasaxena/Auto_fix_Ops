@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Enum, JSON, ForeignKey, Float, Text, Integer
+from sqlalchemy import Column, String, DateTime, Enum, JSON, ForeignKey, Float, Text, Integer, Boolean, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
@@ -246,3 +246,76 @@ class ServiceAccount(Base):
         if not token or len(token) < 8:
             return "***"
         return token[:4] + "****" + token[-4:]
+
+
+class PatchProposal(Base):
+    """
+    Stage 2 AI patch proposal: a reviewable, sandbox-validated diff that is
+    NEVER applied, committed, pushed or deployed. One row per proposer run.
+
+    status: RUNNING | VALIDATED | NOT_GENERATED | REJECTED | FAILED
+    Invariant (enforced in engine.patch_proposer.finalize): unified_diff is set
+    only when status == VALIDATED, and sha256(unified_diff) == diff_sha256.
+    Human approval belongs to Stage 3; the incident itself stays DIAGNOSED.
+    """
+    __tablename__ = "patch_proposals"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id"), nullable=False, index=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("project_config.id"), nullable=True)
+    status = Column(String(16), nullable=False, index=True)
+    reason_code = Column(String(48), nullable=True)
+    reason_detail = Column(Text, nullable=True)
+    action_type = Column(String(32), nullable=True)
+    target_file = Column(String(255), nullable=True)
+    target_ref = Column(JSON, nullable=True)            # kind/name/namespace/container/field/line
+    base = Column(JSON, nullable=True)                  # eol, size, sha256s, git_blob_sha
+    patched_git_blob_sha = Column(String(40), nullable=True)
+    previous_values = Column(JSON, nullable=True)       # PatchGenerator-compatible keys
+    proposed_values = Column(JSON, nullable=True)
+    candidates = Column(JSON, nullable=True)
+    unified_diff = Column(Text, nullable=True)
+    diff_sha256 = Column(String(64), nullable=True)
+    evidence = Column(JSON, nullable=True)
+    llm_decision = Column(JSON, nullable=True)
+    rationale = Column(Text, nullable=True)             # LLM inference; display only
+    review_notes = Column(JSON, nullable=True)
+    validation = Column(JSON, nullable=True)            # ordered per-check results
+    model_info = Column(JSON, nullable=True)
+    source_report = Column(JSON, nullable=True)
+    proposer_version = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class PatchRoutingDecision(Base):
+    """
+    Stage 2 confidence-based routing for AI patch generation. One row per
+    incident and diagnosis version (sha256 of the stored ai_report).
+
+    route:    AUTOMATIC_AI (confidence >= 0.80) | HUMAN_APPROVAL_REQUIRED
+    decision: AUTO | PENDING | APPROVED | REJECTED  (APPROVED/REJECTED are final)
+    The route is computed by the backend from the stored report, never from
+    client input. It decides only whether a human must approve *generation*;
+    it never relaxes a safety check and never authorises applying a patch.
+    """
+    __tablename__ = "patch_routing_decisions"
+    __table_args__ = (UniqueConstraint("incident_id", "report_sha256", name="uq_routing_incident_report"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id"), nullable=False, index=True)
+    report_sha256 = Column(String(64), nullable=False)
+    diagnosis_confidence = Column(Float, nullable=False)
+    route = Column(String(32), nullable=False)
+    approval_required = Column(Boolean, nullable=False)
+    decision = Column(String(16), nullable=False)
+    decided_by = Column(JSON, nullable=True)            # actor info as available; no invented identity
+    decision_reason = Column(Text, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    generation_requested_at = Column(DateTime, nullable=True)   # atomic claim: at most one generation
+    proposal_id = Column(UUID(as_uuid=True), ForeignKey("patch_proposals.id"), nullable=True)
+    proposal_status = Column(String(16), nullable=True)
+    proposal_reason_code = Column(String(48), nullable=True)
+    audit_log = Column(JSON, nullable=True)             # append-only list of events
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True)
