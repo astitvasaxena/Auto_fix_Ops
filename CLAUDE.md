@@ -47,6 +47,8 @@ No lint config exists for Python or the dashboard.
 
 **Config/credentials (`api/config_helpers.py`)** — GitHub creds resolve as: `ServiceAccount` row (Fernet-encrypted token in Postgres, "bot-only" auth) → `.env` `GITHUB_TOKEN`. Project config and system mode (`ACTIVE`/`SHADOW`/`DISABLED`) are read through TTL caches here; call the `invalidate_*` helpers after writes.
 
+**AI path (Stages 2–4)** — with `AI_INCIDENT_ANALYSIS=true` diagnosis stops at `DIAGNOSED`; Stage 2 (`engine/patch_routing.py`, `engine/patch_proposer.py`) produces a sandbox-validated proposal (route by confidence 0.80; the LLM only picks a menu value). Stages 3–4 (`engine/remediation_workflow.py`, table `remediation_runs`, Celery task `advance_remediation`, API `api/remediation.py`) take a human-approved VALIDATED proposal through GitHub PR (`engine/github_gateway.py`), controlled kubectl deployment (`engine/deployer.py`, off unless `DEPLOY_MODE=kubectl`) and recovery verification (`engine/recovery_verifier.py`). Tests use fakes for GitHub/kubectl; see `docs/ARCHITECTURE.md` and `docs/RUNNING_ON_WINDOWS.md`.
+
 **Real-time events (`api/events.py`)** — Celery workers call `emit_sync(...)`, which publishes to Redis PubSub channel `autofixops_events`; the API bridges that to the `/api/v1/events/ws` WebSocket consumed by the dashboard.
 
 **Chaos** — `POST /api/v1/chaos/inject` hits the target app to trigger faults and creates an incident directly (doesn't wait for Alertmanager).
