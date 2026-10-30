@@ -25,6 +25,7 @@ policy decision. It preserves the normal remediation pipeline by default.
 import os
 import requests
 import time
+import datetime
 import uuid
 from .celery_app import celery_app
 from api.database import SessionLocal, incident_contexts_collection, logger
@@ -43,6 +44,7 @@ from engine.policy import PolicyDecisionEngine
 from engine.remediation import RemediationEngine
 from engine.verification import VerificationEngine
 from engine.target_resolver import TargetResolver, TargetResolutionError
+from engine import debug_trace as _dt
 
 
 def _check_kill_switch(incident_id: str) -> bool:
@@ -71,7 +73,8 @@ def _ai_analysis_enabled() -> bool:
     return os.getenv("AI_INCIDENT_ANALYSIS", "true").strip().lower() == "true"
 
 
-def _generate_ai_report(incident, context_doc: dict, summary, rule_verdict: dict) -> dict:
+def _generate_ai_report(incident, context_doc: dict, summary, rule_verdict: dict,
+                        debug_trace: dict = None) -> dict:
     """Builds context, retrieves curated runbooks and asks the analyst LLM for a report.
     Raises on any LLM failure so the caller's retry handling can mark FAILED."""
     incident_id = str(incident.id)
@@ -82,6 +85,11 @@ def _generate_ai_report(incident, context_doc: dict, summary, rule_verdict: dict
         incident_id, incident.alert_name, incident.severity,
         incident.raw_payload_cache, context_doc, summary,
     )
+
+    # ── Debug: record structured context ──
+    if debug_trace is not None:
+        _dt.record_context(debug_trace, context)
+
     min_score = float(os.getenv("RAG_RUNBOOK_MIN_SCORE", "0.35"))
     top_k = int(os.getenv("RAG_RUNBOOK_TOP_K", "3"))
     query = build_runbook_query(context, rule_verdict)
@@ -91,11 +99,21 @@ def _generate_ai_report(incident, context_doc: dict, summary, rule_verdict: dict
         f"hits={[(h['title'], h['similarity_score']) for h in hits]}"
     )
 
+    # ── Debug: record RAG retrieval ──
+    if debug_trace is not None:
+        _dt.record_rag(
+            debug_trace, "ai_analysis",
+            query=query, collection="operational_runbooks",
+            hits=hits, status=rag_status,
+            min_score=min_score, top_k=top_k,
+        )
+
     rag_meta = {
         "collection": "operational_runbooks", "query": query,
         "min_score": min_score, "top_k": top_k, "status": rag_status,
     }
-    return ai_engine.analyze_incident(context, rule_verdict, hits, rag_meta)
+    return ai_engine.analyze_incident(context, rule_verdict, hits, rag_meta,
+                                      debug_trace=debug_trace)
 
 
 def _get_prometheus_url(project_id: str = None) -> str:
@@ -165,17 +183,54 @@ def build_incident_context(self, incident_id: str):
         cpu_data = fetch_prometheus_metric(cpu_query, prometheus_url)
         mem_data = fetch_prometheus_metric(mem_query, prometheus_url)
 
-        context_doc = {
+        raw_payload = incident.raw_payload_cache or {}
+        raw_context = {
             "incident_id": incident_id,
-            "project_id": project_id,
-            "metrics": {"cpu": cpu_data, "memory": mem_data},
+            "project_id": project_id or "unavailable",
+            "stage": "PRE_DIAGNOSIS",
+            "status": "CONTEXT_BUILT",
+            "collected_at": datetime.datetime.utcnow().isoformat() + "Z",
             "timestamp": time.time(),
+            "alert": {
+                "name": incident.alert_name,
+                "severity": incident.severity,
+                "labels": raw_payload.get("labels", {}),
+                "annotations": raw_payload.get("annotations", {}),
+            },
+            "target": {
+                "pod": pod_name if pod_name != "unknown" else "unavailable",
+                "namespace": raw_payload.get("labels", {}).get("namespace", "autofixops"),
+                "project_id": project_id or "unavailable",
+            },
+            "chaos": {
+                "is_chaos": bool(raw_payload.get("chaos", False)),
+                "fault_type": raw_payload.get("fault_type", "unavailable"),
+                "target_url": raw_payload.get("target_url", "unavailable"),
+            },
+            "telemetry": {
+                "cpu_metrics": cpu_data if cpu_data else "unavailable",
+                "memory_metrics": mem_data if mem_data else "unavailable",
+                "cpu_available": bool(cpu_data),
+                "memory_available": bool(mem_data),
+                "prometheus_url": prometheus_url or "unavailable",
+            },
+            # Compatibility with existing ContextSummarizer & MongoDB consumers
+            "metrics": {"cpu": cpu_data, "memory": mem_data},
             "target_pod": pod_name,
         }
 
+        # 1. Persist to PostgreSQL in incident.raw_payload_cache
+        payload = dict(raw_payload)
+        payload["raw_context"] = raw_context
+        incident.raw_payload_cache = payload
+
+        # 2. Persist to disk trace immediately (before diagnose_incident runs)
+        _dt.save_pre_diagnosis_trace(incident_id, raw_context)
+
+        # 3. Persist to MongoDB (graceful degradation)
         try:
             incident_contexts_collection.update_one(
-                {"incident_id": incident_id}, {"$set": context_doc}, upsert=True
+                {"incident_id": incident_id}, {"$set": raw_context}, upsert=True
             )
         except Exception as mongo_err:
             logger.warning(
@@ -214,6 +269,9 @@ def diagnose_incident(self, incident_id: str):
     logger.info(f"[TRACE:{incident_id}] === [TASK 2: DIAGNOSIS] START ===")
     db = SessionLocal()
 
+    # ── Debug: create or load per-incident trace envelope ──
+    trace = _dt.load_or_new_trace(incident_id)
+
     try:
         incident = db.query(Incident).filter(Incident.id == incident_id).first()
         if not incident:
@@ -229,9 +287,12 @@ def diagnose_incident(self, incident_id: str):
         except Exception as mongo_err:
             logger.warning(
                 f"[TRACE:{incident_id}] MongoDB read failed ({mongo_err.__class__.__name__}); "
-                f"using empty context."
+                f"checking relational DB context."
             )
             context_doc = None
+
+        if not context_doc and incident.raw_payload_cache and "raw_context" in incident.raw_payload_cache:
+            context_doc = incident.raw_payload_cache["raw_context"]
 
         if not context_doc:
             logger.warning(
@@ -243,16 +304,24 @@ def diagnose_incident(self, incident_id: str):
         alert_name = incident.alert_name
 
         # Summarize
+        _dt.record_stage_start(trace, "summarize")
         summary = ContextSummarizer.summarize(context_doc)
+        _dt.record_stage_end(trace, "summarize", summary=summary.model_dump())
         logger.info(f"[TRACE:{incident_id}] Summary: {summary.model_dump_json()}")
 
         # Rule Engine first
+        _dt.record_stage_start(trace, "rule_engine")
         rule_engine = RuleBasedDiagnosisEngine()
         verdict = rule_engine.analyze(alert_name, context_doc)
+        _dt.record_rule_engine(trace, verdict)
+        _dt.record_stage_end(trace, "rule_engine")
 
         # Analysis stage: context + runbook RAG + LLM report, then STOP at DIAGNOSED.
         if _ai_analysis_enabled():
-            report = _generate_ai_report(incident, context_doc, summary, verdict)
+            _dt.record_stage_start(trace, "ai_analysis")
+            report = _generate_ai_report(incident, context_doc, summary, verdict,
+                                         debug_trace=trace)
+            _dt.record_stage_end(trace, "ai_analysis")
 
             incident.ai_report = report
             incident.diagnosis_classification = report["incident_type"]
@@ -265,6 +334,9 @@ def diagnose_incident(self, incident_id: str):
             emit_sync("incident.status_changed", {"new_status": "DIAGNOSED"}, str(incident.id))
             emit_sync("incident.ai_report_ready", {"proposed_action": report["proposed_action"]["type"], "confidence": report["confidence"]}, str(incident.id))
             db.commit()
+
+            # ── Debug: save trace to disk ──
+            _dt.save_trace(trace)
 
             logger.info(
                 f"[TRACE:{incident_id}] === [TASK 2: AI ANALYSIS] DONE → DIAGNOSED "
@@ -281,12 +353,25 @@ def diagnose_incident(self, incident_id: str):
             logger.info(f"[TRACE:{incident_id}] Rule Engine → UNKNOWN. Invoking AI...")
             diagnosed_by = "AI_ENGINE"
 
+            _dt.record_stage_start(trace, "legacy_rag")
             memory_store = QdrantMemoryStore()
             rag_hits = memory_store.retrieve_similar(summary.model_dump_json(), top_k=2)
             failed_hits = memory_store.retrieve_failures(summary.model_dump_json(), top_k=2)
+            _dt.record_rag(
+                trace, "legacy_rag",
+                query=summary.model_dump_json()[:200],
+                collection="incident_resolutions+incident_failures",
+                hits=rag_hits + (failed_hits or []),
+                status="ok" if rag_hits else "no_match",
+                min_score=0.75, top_k=2,
+            )
+            _dt.record_stage_end(trace, "legacy_rag")
 
+            _dt.record_stage_start(trace, "legacy_diagnosis")
             ai_engine = AIDiagnosisEngine()
-            ai_verdict = ai_engine.analyze(summary, rag_hits, failed_hits=failed_hits)
+            ai_verdict = ai_engine.analyze(summary, rag_hits, failed_hits=failed_hits,
+                                           debug_trace=trace)
+            _dt.record_stage_end(trace, "legacy_diagnosis")
 
             verdict = {
                 "root_cause_classification": ai_verdict.get("diagnosis"),
@@ -308,6 +393,9 @@ def diagnose_incident(self, incident_id: str):
         emit_sync("incident.status_changed", {"new_status": "DIAGNOSED"}, str(incident.id))
         db.commit()
 
+        # ── Debug: save trace to disk ──
+        _dt.save_trace(trace)
+
         logger.info(
             f"[TRACE:{incident_id}] === [TASK 2: DIAGNOSIS] DONE → DIAGNOSED "
             f"({diagnosed_by}: {verdict.get('root_cause_classification')}) ==="
@@ -318,6 +406,9 @@ def diagnose_incident(self, incident_id: str):
         return True
 
     except Exception as e:
+        # ── Debug: save trace even on failure ──
+        _dt.record_stage_end(trace, "diagnosis_error", error=f"{e.__class__.__name__}: {e}")
+        _dt.save_trace(trace)
         logger.error(f"[TRACE:{incident_id}] [TASK 2 FAILED] {e}")
         return _retry_or_fail(self, db, incident_id, e, "diagnose_incident")
     finally:

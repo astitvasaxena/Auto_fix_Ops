@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import datetime
+import time as _time
 from typing import Dict, Any, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 from langchain_core.prompts import PromptTemplate
@@ -10,6 +11,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import PydanticOutputParser
 
 from .summarizer import IncidentSummary
+from . import debug_trace as _dt
 
 logger = logging.getLogger("autofixops")
 
@@ -352,17 +354,40 @@ Known Failed Approaches (DO NOT recommend these actions for similar incidents):
             partial_variables={"format_instructions": self.parser.get_format_instructions()},
         )
 
-    def analyze(self, summary: IncidentSummary, rag_hits: list, failed_hits: list = None) -> Dict[str, Any]:
+    def analyze(self, summary: IncidentSummary, rag_hits: list, failed_hits: list = None,
+                debug_trace: Optional[Dict] = None) -> Dict[str, Any]:
         logger.info("[AI ENGINE] Invoking deterministic LLM chain.")
         
         chain = self.prompt | self.verdict_llm | self.parser
-        
+        invoke_args = {
+            "summary_json": summary.model_dump_json(),
+            "rag_context": str(rag_hits) if rag_hits else "No history available.",
+            "failed_context": str(failed_hits) if failed_hits else "No known failures."
+        }
+
+        # ── Debug: render prompt for tracing ──
+        rendered_prompt = ""
         try:
-            verdict: AIFinalVerdict = chain.invoke({
-                "summary_json": summary.model_dump_json(),
-                "rag_context": str(rag_hits) if rag_hits else "No history available.",
-                "failed_context": str(failed_hits) if failed_hits else "No known failures."
-            })
+            rendered_prompt = self.prompt.format(**invoke_args)
+        except Exception:
+            pass
+        
+        t0 = _time.perf_counter()
+        try:
+            verdict: AIFinalVerdict = chain.invoke(invoke_args)
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            raw_response = verdict.model_dump_json()
+
+            # ── Debug: record successful LLM call ──
+            if debug_trace is not None:
+                _dt.record_llm_call(
+                    debug_trace, "legacy_diagnosis",
+                    rendered_prompt=rendered_prompt,
+                    raw_response=raw_response,
+                    parsed_output=verdict,
+                    model=self.model_name, provider=self.provider,
+                    elapsed_ms=elapsed_ms,
+                )
             
             # 1. Dual Validation / Guard: Confidence Threshold rejection
             if verdict.confidence < 0.75:
@@ -378,6 +403,18 @@ Known Failed Approaches (DO NOT recommend these actions for similar incidents):
             return verdict.model_dump()
             
         except Exception as e:
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            # ── Debug: record failed LLM call ──
+            if debug_trace is not None:
+                _dt.record_llm_call(
+                    debug_trace, "legacy_diagnosis",
+                    rendered_prompt=rendered_prompt,
+                    raw_response="",
+                    parsed_output=None,
+                    model=self.model_name, provider=self.provider,
+                    elapsed_ms=elapsed_ms,
+                    error=f"{e.__class__.__name__}: {e}",
+                )
             logger.error(f"[AI ENGINE FAILED] LLM generated invalid output or crashed: {e}")
             return self._trigger_fallback(f"Pydantic validation or API error: {e}")
 
@@ -398,6 +435,7 @@ Known Failed Approaches (DO NOT recommend these actions for similar incidents):
         rule_verdict: Dict[str, Any],
         runbook_hits: List[Dict[str, Any]],
         rag_meta: Dict[str, Any],
+        debug_trace: Optional[Dict] = None,
     ) -> Dict[str, Any]:
         """Produces the structured AI Incident Report (analyst only — nothing is executed).
 
@@ -410,11 +448,53 @@ Known Failed Approaches (DO NOT recommend these actions for similar incidents):
             f"({len(runbook_hits)} runbook(s), status={rag_meta.get('status')})."
         )
         chain = self.report_prompt | self.llm | self.report_parser
-        report: AIIncidentReport = chain.invoke({
+        invoke_args = {
             "incident_context": json.dumps(incident_context, indent=2, default=str),
             "rule_engine": json.dumps(rule_verdict, indent=2, default=str),
             "runbook_context": _format_runbook_context(runbook_hits, rag_meta.get("min_score")),
-        })
+        }
+
+        # ── Debug: render prompt for tracing ──
+        rendered_prompt = ""
+        try:
+            rendered_prompt = self.report_prompt.format(**invoke_args)
+        except Exception:
+            pass
+
+        t0 = _time.perf_counter()
+        error_str = None
+        raw_response = ""
+        try:
+            report: AIIncidentReport = chain.invoke(invoke_args)
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            raw_response = report.model_dump_json()
+        except Exception as e:
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            error_str = f"{e.__class__.__name__}: {e}"
+            # ── Debug: record failed LLM call ──
+            if debug_trace is not None:
+                _dt.record_llm_call(
+                    debug_trace, "ai_analysis",
+                    rendered_prompt=rendered_prompt,
+                    raw_response="",
+                    parsed_output=None,
+                    model=self.model_name, provider=self.provider,
+                    elapsed_ms=elapsed_ms,
+                    error=error_str,
+                )
+            raise  # re-raise — analyze_incident() does NOT swallow errors
+
+        # ── Debug: record successful LLM call ──
+        if debug_trace is not None:
+            _dt.record_llm_call(
+                debug_trace, "ai_analysis",
+                rendered_prompt=rendered_prompt,
+                raw_response=raw_response,
+                parsed_output=report,
+                model=self.model_name, provider=self.provider,
+                elapsed_ms=elapsed_ms,
+            )
+
         validate_report(report, runbook_hits)
 
         # Runbook citations are re-attached to the retrieval metadata, so the
