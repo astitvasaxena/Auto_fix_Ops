@@ -44,6 +44,7 @@ from engine.policy import PolicyDecisionEngine
 from engine.remediation import RemediationEngine
 from engine.verification import VerificationEngine
 from engine.target_resolver import TargetResolver, TargetResolutionError
+from engine.telemetry import collect_telemetry
 from engine import debug_trace as _dt
 
 
@@ -177,15 +178,22 @@ def build_incident_context(self, incident_id: str):
         prometheus_url = _get_prometheus_url(project_id)
         pod_name = incident.raw_payload_cache.get("labels", {}).get("pod", "unknown")
 
-        # Gather evidence
-        cpu_query = f'rate(container_cpu_usage_seconds_total{{namespace="autofixops", pod="{pod_name}"}}[1m])'
-        mem_query = f'avg_over_time(container_memory_working_set_bytes{{namespace="autofixops", pod="{pod_name}"}}[5m])'
-        cpu_data = fetch_prometheus_metric(cpu_query, prometheus_url)
-        mem_data = fetch_prometheus_metric(mem_query, prometheus_url)
+        # Gather evidence: Kubernetes container metrics first, then the target
+        # app's own process metrics (local demo). Memory in bytes, CPU in cores.
+        telemetry = collect_telemetry(
+            lambda q: fetch_prometheus_metric(q, prometheus_url),
+            incident.raw_payload_cache.get("labels", {}),
+        )
+        cpu_data = telemetry["metrics"]["cpu"]
+        mem_data = telemetry["metrics"]["memory"]
+        logger.info(
+            f"[TRACE:{incident_id}] Telemetry source={telemetry['source']} "
+            f"memory_series={len(mem_data)} cpu_series={len(cpu_data)}"
+        )
 
         raw_payload = incident.raw_payload_cache or {}
         raw_context = {
-            "incident_id": incident_id,
+            "incident_id": str(incident_id),
             "project_id": project_id or "unavailable",
             "stage": "PRE_DIAGNOSIS",
             "status": "CONTEXT_BUILT",
@@ -213,6 +221,9 @@ def build_incident_context(self, incident_id: str):
                 "cpu_available": bool(cpu_data),
                 "memory_available": bool(mem_data),
                 "prometheus_url": prometheus_url or "unavailable",
+                "source": telemetry["source"] or "unavailable",
+                "units": telemetry["units"],
+                "queries": telemetry["queries"],
             },
             # Compatibility with existing ContextSummarizer & MongoDB consumers
             "metrics": {"cpu": cpu_data, "memory": mem_data},
@@ -225,7 +236,7 @@ def build_incident_context(self, incident_id: str):
         incident.raw_payload_cache = payload
 
         # 2. Persist to disk trace immediately (before diagnose_incident runs)
-        _dt.save_pre_diagnosis_trace(incident_id, raw_context)
+        _dt.save_pre_diagnosis_trace(str(incident_id), raw_context)
 
         # 3. Persist to MongoDB (graceful degradation)
         try:
@@ -270,7 +281,7 @@ def diagnose_incident(self, incident_id: str):
     db = SessionLocal()
 
     # ── Debug: create or load per-incident trace envelope ──
-    trace = _dt.load_or_new_trace(incident_id)
+    trace = _dt.load_or_new_trace(str(incident_id))
 
     try:
         incident = db.query(Incident).filter(Incident.id == incident_id).first()

@@ -1,5 +1,6 @@
 import os
 import hashlib
+import uuid
 import time
 from typing import Optional
 from fastapi import FastAPI, Depends, Request, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -852,7 +853,7 @@ def delete_service_account(db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/incidents/{incident_id}/debug")
-def get_incident_debug(incident_id: str, db: Session = Depends(get_db)):
+def get_incident_debug(incident_id: uuid.UUID, db: Session = Depends(get_db)):
     """Returns the pre-diagnosis raw context, AI-prepared context, and diagnosis trace.
 
     Includes:
@@ -867,6 +868,7 @@ def get_incident_debug(incident_id: str, db: Session = Depends(get_db)):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)   # string form for trace files and the context store
 
     raw_payload = incident.raw_payload_cache or {}
     trace = load_trace(incident_id)
@@ -988,13 +990,14 @@ def get_incident_debug(incident_id: str, db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/incidents/{incident_id}/pre-diagnosis-context")
-def get_pre_diagnosis_context(incident_id: str, db: Session = Depends(get_db)):
+def get_pre_diagnosis_context(incident_id: uuid.UUID, db: Session = Depends(get_db)):
     """Simple, dedicated endpoint to inspect only the pre-diagnosis incident context."""
     from engine.debug_trace import load_trace
 
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)   # string form for trace files and the context store
 
     raw_payload = incident.raw_payload_cache or {}
     raw_context = raw_payload.get("raw_context")

@@ -2,9 +2,9 @@ from typing import Dict, Any, List
 from pydantic import BaseModel, Field
 
 class IncidentSummary(BaseModel):
-    cpu_peak: float = Field(description="Max CPU percentage hit during the window.")
+    cpu_peak: float = Field(description="Peak CPU usage in the window, in CPU cores (0.5 = 500m).")
     cpu_trend: str = Field(description="One of: HIGH_SUSTAINED, CLIMBING, STABLE, UNKNOWN")
-    memory_peak: float = Field(description="Max Memory percentage hit during the window.")
+    memory_peak: float = Field(description="Peak memory usage in the window, in bytes.")
     memory_trend: str = Field(description="One of: RAPID_CLIMB, SLOW_LEAK, STABLE, UNKNOWN")
     context_tags: List[str] = Field(description="Metadata and inferred symptom labels.")
 

@@ -1,9 +1,32 @@
 from fastapi import BackgroundTasks, FastAPI, Response
 import asyncio
 import os
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 app = FastAPI(title="AutoFixOps Target App")
+
+
+class PortableProcessCollector:
+    """prometheus_client's built-in process collector reads Linux /proc only, so on
+    Windows/macOS /metrics had no memory or CPU series and the memory/crash alerts
+    could never fire. This exports the same standard metric names via psutil."""
+
+    def collect(self):
+        import psutil
+
+        proc = psutil.Process()
+        mem, cpu = proc.memory_info(), proc.cpu_times()
+        yield GaugeMetricFamily("process_resident_memory_bytes", "Resident memory size in bytes.", value=mem.rss)
+        yield GaugeMetricFamily("process_virtual_memory_bytes", "Virtual memory size in bytes.", value=mem.vms)
+        yield CounterMetricFamily("process_cpu_seconds_total", "Total user and system CPU time spent in seconds.",
+                                  value=cpu.user + cpu.system)
+        yield GaugeMetricFamily("process_start_time_seconds", "Start time of the process since unix epoch in seconds.",
+                                value=proc.create_time())
+
+
+if not os.path.exists("/proc/self/stat"):   # not Linux: the built-in collector exports nothing
+    REGISTRY.register(PortableProcessCollector())
 
 # Global variables for chaos memory
 data = []

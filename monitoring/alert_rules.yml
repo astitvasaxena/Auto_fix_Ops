@@ -1,6 +1,7 @@
 # AutoFixOps Alert Rules
 # These fire webhooks to the AutoFixOps API via Alertmanager
-# when the Render-hosted test app shows anomalies.
+# when the local target app (kubernetes_integration/target_app, port 8001)
+# shows anomalies. Metrics are the standard process_* series it exports.
 
 groups:
   - name: autofixops_target_app
@@ -21,17 +22,20 @@ groups:
           pod: autofixops-target-app
           container: target-app
         annotations:
-          summary: "Memory leak detected on shortener-api"
+          summary: "Memory leak detected on autofixops-target-app"
           description: >
-            Container api in pod shortener-api in namespace shortener
-            has increased memory by more than 50MB in the last 2 minutes.
-            This indicates a potential memory leak.
-          runbook_url: "https://shortener-api-qurk.onrender.com"
+            Container target-app in pod autofixops-target-app (namespace autofixops)
+            increased its memory by more than 50MB in the last 2 minutes.
+            This indicates a potential memory leak and OOMKilled risk.
 
       # ── High Absolute Memory ─────────────────────────────────
-      # Fires when RSS exceeds 150MB (baseline is ~85MB).
+      # Fires when RSS exceeds 85% of the 100Mi memory limit declared in
+      # kubernetes_integration/target_app/deployment.yaml (0.85 * 104857600).
+      # Baseline RSS is ~50MB. Keep this in step with the manifest limit: the
+      # Stage 2 proposer only proposes an increase at >= 80% utilisation.
+      # Annotations carry no numbers: the LLMs may only cite measured facts.
       - alert: HighMemoryUsage
-        expr: process_resident_memory_bytes{job="autofixops-target"} > 150000000
+        expr: process_resident_memory_bytes{job="autofixops-target"} > 89128960
         for: 15s
         labels:
           severity: warning
@@ -39,15 +43,15 @@ groups:
           pod: autofixops-target-app
           container: target-app
         annotations:
-          summary: "High memory usage on shortener-api"
+          summary: "High memory usage on autofixops-target-app"
           description: >
-            Container api in pod shortener-api is using more than 150MB
-            of memory, exceeding the threshold.
+            Container target-app in pod autofixops-target-app is using most
+            of its memory limit (OOMKilled risk).
 
       # ── CrashLoop Detection (via process restart) ────────────
       # Detects when the process has restarted at least once
       # in the last 5 minutes by tracking changes in
-      # process_start_time_seconds. Render restarts too fast
+      # process_start_time_seconds. Fast restarts are too quick
       # for the `up==0` approach to catch.
       - alert: TargetAppCrashLoop
         expr: changes(process_start_time_seconds{job="autofixops-target"}[5m]) > 0
@@ -60,10 +64,9 @@ groups:
         annotations:
           summary: "Target app is crash-looping (process restarted)"
           description: >
-            The shortener-api process has restarted
+            The target-app process has restarted
             {{ $value }} time(s) in the last 5 minutes.
             This indicates a crash loop or forced restart.
-          runbook_url: "https://shortener-api-qurk.onrender.com"
 
       # ── Target Completely Down ───────────────────────────────
       # Fires if the scrape target is totally unreachable for 30s.
@@ -78,6 +81,5 @@ groups:
         annotations:
           summary: "Target app is completely unreachable"
           description: >
-            The shortener-api target has been unreachable for >30 seconds.
+            The target-app scrape target has been unreachable for >30 seconds.
             Prometheus scrape failures indicate the application is down.
-          runbook_url: "https://shortener-api-qurk.onrender.com"

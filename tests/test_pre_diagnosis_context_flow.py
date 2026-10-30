@@ -22,21 +22,67 @@ WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if WORKSPACE_DIR not in sys.path:
     sys.path.insert(0, WORKSPACE_DIR)
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import asyncio
+from contextlib import ExitStack
+from unittest.mock import patch
+
 import httpx
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+import api.main as api_main
 from api.main import app
-from api.database import SessionLocal
-from api.models import Incident, IncidentStatus
+from api.database import get_db
+from api.models import Base, Incident, IncidentStatus
 import workers.tasks as tasks
 from engine import debug_trace as _dt
 
 
-async def test_crash_loop_context_lifecycle():
+class _NoContextStore:
+    """Stands in for MongoDB: forces the Postgres raw_context fallback path."""
+    def find_one(self, *a, **kw):
+        return None
+
+    def update_one(self, *a, **kw):
+        return None
+
+
+def _isolated_session():
+    """In-memory SQLite: the test never touches the real Postgres database."""
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+def test_crash_loop_context_lifecycle():
+    Session = _isolated_session()
+
+    def _get_db():
+        db = Session()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(tasks, "SessionLocal", Session))
+        stack.enter_context(patch.object(tasks, "_check_kill_switch", lambda _id: False))
+        stack.enter_context(patch.object(tasks, "emit_sync", lambda *a, **kw: None))
+        stack.enter_context(patch.object(tasks, "fetch_prometheus_metric", lambda *a, **kw: []))
+        stack.enter_context(patch.object(tasks, "incident_contexts_collection", _NoContextStore()))
+        stack.enter_context(patch.object(api_main, "incident_contexts_collection", _NoContextStore()))
+        stack.enter_context(patch.dict(os.environ, {"DEBUG_PROMPTS": "false"}))
+        app.dependency_overrides[get_db] = _get_db
+        try:
+            asyncio.run(_flow(Session))
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+
+async def _flow(Session):
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
-    db = SessionLocal()
+    db = Session()
 
     print("\n" + "=" * 60)
     print("TEST: Pre-Diagnosis Context Capture & Retrieval Flow")
@@ -82,13 +128,13 @@ async def test_crash_loop_context_lifecycle():
     # Note: we bypass the Celery async chain to inspect between Task 1 and Task 2
     from unittest.mock import patch
     with patch.object(tasks.diagnose_incident, "apply_async") as mock_diagnose_chain:
-        success = tasks.build_incident_context.run(incident_id)
+        success = tasks.build_incident_context.run(incident.id)  # UUID: SQLite cannot bind str ids
         assert success is True, "build_incident_context should return True"
         assert mock_diagnose_chain.called, "Should attempt to enqueue diagnose_incident"
 
     # Refresh DB
     db.expire_all()
-    incident_after_t1 = db.query(Incident).filter(Incident.id == incident_id).first()
+    incident_after_t1 = db.query(Incident).filter(Incident.id == incident.id).first()
     assert incident_after_t1.status == IncidentStatus.CONTEXT_BUILT
     print(f"  \u2714 Incident transitioned to CONTEXT_BUILT")
 
@@ -168,7 +214,7 @@ async def test_crash_loop_context_lifecycle():
 
     with patch.object(tasks, "QdrantMemoryStore", lambda: store), \
          patch.object(tasks, "AIDiagnosisEngine", lambda: AIDiagnosisEngine(llm=mock_llm)):
-        tasks.diagnose_incident.run(incident_id)
+        tasks.diagnose_incident.run(incident.id)
 
     # 5. Inspect API response AFTER diagnosis has completed
     print("\n[STEP 5] Inspecting context AFTER AI diagnosis completed...")
@@ -224,5 +270,5 @@ async def test_crash_loop_context_lifecycle():
 
 
 if __name__ == "__main__":
-    asyncio.run(test_crash_loop_context_lifecycle())
+    test_crash_loop_context_lifecycle()
 

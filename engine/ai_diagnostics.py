@@ -155,6 +155,9 @@ def build_analysis_context(
         },
         "telemetry": (
             {"available": True, "summary": summary.model_dump(),
+             "units": {"memory_peak": "bytes", "cpu_peak": "CPU cores"},
+             "memory_peak_mib": round(summary.memory_peak / 1024 ** 2, 1),
+             "source": ((context_doc or {}).get("telemetry") or {}).get("source", "unavailable"),
              "target_pod": (context_doc or {}).get("target_pod")}
             if telemetry_available else
             {"available": False,
