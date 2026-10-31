@@ -139,7 +139,7 @@ class MenuStubLLM:
         resource, menu = re.search(r"MENU for the (memory|cpu) limit: ([^\n]+)", text).groups()
         values = [v.strip() for v in menu.split(",")]
         self.menus.append(values)
-        runbook = "k8s-oomkilled-memory-pressure" if resource == "memory" else "k8s-cpu-limits-throttling"
+        runbook = re.search(r"runbook_id ([a-z0-9-]+)\):", text).group(1)   # cite the runbook offered
         return _decision(new_value=values[0], runbook_ids=(runbook,), rationale=self.rationale)
 
 

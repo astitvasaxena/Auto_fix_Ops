@@ -149,6 +149,22 @@ def test_oomkilled_crash_loop_produces_validated_patch_with_the_bounded_maximum(
     print("✅ PASS: CRASH_LOOP + repeated OOMKilled at 100Mi -> VALIDATED 200Mi (bounded maximum only)")
 
 
+def test_crash_runbook_supports_only_crash_loops_with_memory_evidence():
+    crash_rag = {"status": "ok", "retrieved": [{"runbook_id": "prometheus-target-availability"},
+                                               {"runbook_id": "k8s-repeated-container-failure"}]}
+    llm = base.MenuStubLLM()
+    result, _, SF, _ = _run(_evidence(), report=_crash_report(rag=crash_rag), llm=llm)
+    assert result["status"] == pp.VALIDATED, (result["reason_code"], result.get("reason_detail"))
+    row = base._rows(SF)[0]
+    assert row.evidence["runbooks_offered"][0]["runbook_id"] == "k8s-repeated-container-failure"
+    assert "Change memory limits only if the termination reason is OOMKilled" in llm.prompts[0]
+    # The crash runbook is not enough for a HIGH_MEMORY (usage-based) proposal.
+    report = base._report(rag=crash_rag)
+    result, llm, _, _ = base.run_case(report=report, llm=base.MenuStubLLM())
+    assert result["reason_code"] == "NO_SUPPORTING_RUNBOOK" and not llm.prompts
+    print("✅ PASS: the official crash runbook supports a memory patch only for an OOMKilled crash loop")
+
+
 def test_crash_loop_with_other_causes_is_refused():
     for kw in ({"reason": "Error", "exit_code": 1}, {"reason": "Completed", "exit_code": 0}):
         result, llm, _, _ = _run(_evidence(**kw))

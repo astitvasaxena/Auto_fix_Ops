@@ -141,6 +141,7 @@ VERIFY_HEADROOM = 0.80
 # A crash loop is attributed to memory from measurements only when the peak reached the limit
 # (on nodes with swap the container is not OOMKilled; it thrashes and fails its probes).
 CRASH_LOOP_MIN_UTILISATION = 1.0
+CRASH_LOOP_RUNBOOK = "k8s-repeated-container-failure"
 POLICY_MAX_FACTOR = 2.0
 MAX_PLAUSIBLE_UTILISATION = 1.5   # a peak far above the limit means the manifest is not what ran
 EXIT_INTERRUPTED = 130
@@ -469,12 +470,17 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
         evidence_mode, peak = "utilisation", float(summary.get(spec["peak_key"]))
 
     retrieved = {h.get("runbook_id") for h in retrieved_hits if isinstance(h, dict)}
-    runbook = next((d for d in load_runbooks() if d["runbook_id"] == spec["runbook"]), None)
-    if (rag.get("status") != "ok" or spec["runbook"] not in retrieved or runbook is None
-            or runbook.get("verified") is not True or runbook.get("source_status") != "curated"
-            or runbook.get("source_type") != "official_documentation"):
+    # The memory runbook supports a limit increase; for a crash loop with memory evidence the
+    # official crash runbook does too ("change memory limits only if the termination reason is
+    # OOMKilled"). The first one retrieved, in this order, is used.
+    accepted = [spec["runbook"]] + ([CRASH_LOOP_RUNBOOK] if crash_loop_memory else [])
+    official = {d["runbook_id"]: d for d in load_runbooks()
+                if d.get("verified") is True and d.get("source_status") == "curated"
+                and d.get("source_type") == "official_documentation"}
+    runbook = next((official[r] for r in accepted if r in retrieved and r in official), None)
+    if rag.get("status") != "ok" or runbook is None:
         raise ProposalStop(NOT_GENERATED, "NO_SUPPORTING_RUNBOOK",
-                           f"official runbook {spec['runbook']} was not retrieved for this incident")
+                           f"official runbook {' or '.join(accepted)} was not retrieved for this incident")
     return {"report": report, "parsed": parsed, "action": action, "spec": spec,
             "peak": peak, "evidence_mode": evidence_mode, "oom": oom, "restarting": restarting,
             "crash_loop": crash_loop,
