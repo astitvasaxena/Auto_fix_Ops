@@ -64,20 +64,21 @@ export default function KubernetesTargetCard({ showChaos = true }) {
       )}
       {data.chaos && !data.chaos.error && (
         <p className="text-sm text-muted" style={{ marginTop: 8 }}>
-          Crash-loop chaos: start-up memory <span className="mono">{data.chaos.startup_memory_mb} MB</span>
-          {data.chaos.startup_memory_mb > 0 ? ' (active)' : ' (off)'}
+          Chaos: {data.chaos.active
+            ? <span style={{ color: 'var(--error)' }}>{data.chaos.active_faults.join(', ')} active, expires in {Math.ceil(data.chaos.seconds_left / 60)} min</span>
+            : 'none active'}
+          {' · '}limits <span className="mono">{data.chaos.memory_limit} / {data.chaos.cpu_limit}</span>
         </p>
       )}
       {showChaos && ev?.available && (
         <div style={{ marginTop: 12 }}>
           {!data.chaos_enabled ? (
-            <p className="text-sm text-muted">Kubernetes chaos is off (set <span className="mono">CHAOS_K8S_ENABLED=true</span> for the API), or use <span className="mono">python scripts/k8s_demo.py chaos crashloop</span>.</p>
+            <p className="text-sm text-muted">Kubernetes chaos is off (set <span className="mono">CHAOS_K8S_ENABLED=true</span> for the API), or use <span className="mono">python scripts/k8s_demo.py chaos crashloop|memoryleak|cpuspike</span>.</p>
           ) : (
             <div className="flex" style={{ gap: 8 }}>
               <div className="confirm-input" style={{ flex: 1 }}>
                 <input value={confirm} placeholder="Type CONFIRM" onChange={(e) => setConfirm(e.target.value)} />
               </div>
-              <button className="btn btn-danger" disabled={busy || confirm !== 'CONFIRM'} onClick={() => inject('crash_loop')}>💥 Inject crash loop</button>
               <button className="btn btn-outline" disabled={busy || confirm !== 'CONFIRM'} onClick={() => inject('reset')}>Reset chaos</button>
             </div>
           )}

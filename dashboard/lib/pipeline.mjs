@@ -56,6 +56,14 @@ export function pipelineStates(incident, run = null) {
     return states;
   }
   if (status === 'ESCALATED') {
+    if (run && run.final && ['FAILED', 'ROLLED_BACK', 'ROLLBACK_FAILED'].includes(run.stage)) {
+      // An approved remediation failed: show where, and that a human now owns the incident.
+      const deployed = Boolean(run.deployment?.patched);
+      states[IDX.policy] = 'completed';
+      states[IDX.remediation] = deployed ? 'completed' : 'failed';
+      states[IDX.verification] = deployed ? 'failed' : 'idle';
+      return states;
+    }
     states[IDX.policy] = 'warning';
     return states;
   }
@@ -68,6 +76,28 @@ export function pipelineStates(incident, run = null) {
   }
   if (next < STAGES.length) states[next] = 'active';
   return states;
+}
+
+// ─── Chaos page ───
+
+export const CHAOS_FAULTS = [
+  { id: 'memory_leak', name: 'Memory Leak', icon: '🧠', severity: 'HIGH',
+    kubernetes: { desc: 'Memory keeps growing (40 MB/min) until the pod is OOMKilled, again after every restart.',
+      outcome: 'memory alerts, OOMKilled restarts; AutoFixOps escalates (a larger limit only delays a leak)' },
+    local: { desc: 'Calls /leak on the local process once (+10 MB).', outcome: 'a ChaosInjection incident' } },
+  { id: 'cpu_spike', name: 'CPU Spike', icon: '🔥', severity: 'MEDIUM',
+    kubernetes: { desc: 'CPU demand of 140% of the CPU limit: the pod is pinned at its limit and throttled.',
+      outcome: 'HighCPUUsage alert; CPU limit increase after approval and merge' },
+    local: { desc: 'Calls /cpu on the local process (a busy loop in one thread).', outcome: 'a ChaosInjection incident' } },
+  { id: 'crash_loop', name: 'Crash Loop', icon: '💀', severity: 'HIGH',
+    kubernetes: { desc: 'Start-up needs more memory than the limit: OOMKilled at every start, CrashLoopBackOff.',
+      outcome: 'TargetAppDown alert; memory limit increase after approval and merge' },
+    local: { desc: 'Calls /_chaos/crash on the local process (exits once).', outcome: 'a ChaosInjection incident' } },
+];
+
+/** "kubernetes" when the API reports an available, chaos-enabled Kubernetes target; else "local". */
+export function chaosMode(k8s) {
+  return k8s?.chaos_enabled === true && k8s?.evidence?.available === true ? 'kubernetes' : 'local';
 }
 
 // ─── Stage 3-4 panel helpers ───
