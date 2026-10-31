@@ -20,7 +20,8 @@ Target App → Prometheus → Alertmanager → AutoFixOps API → Context → Di
 | — | Alert ingestion, context, rule + AI diagnosis, runbook RAG | Done; telemetry collection fixed (real memory/CPU peaks) |
 | 2 | AI patch proposals: confidence routing (0.80), human approval of generation, 16 mandatory safety checks | Done; a genuine `VALIDATED` proposal was produced from a real Alertmanager incident |
 | 3 | Human approval of the exact proposal, audit trail, GitHub branch + commit + PR, duplicate prevention | Implemented and tested with a fake GitHub; a real PR needs your token and repository |
-| 4 | Controlled `kubectl` deployment (allowlist, dry run, drift-safe JSON patch, lock), recovery verification with stabilization window, rollback + revert PR | Implemented and tested with a fake cluster; a live run needs Docker Desktop Kubernetes |
+| 4 | Controlled `kubectl` deployment (allowlist, dry run, drift-safe JSON patch, lock), CI gate, recovery verification with stabilization window, rollback + revert PR | Implemented; tested with fakes and wired to a real Docker Desktop cluster (see the runbook for what has run live) |
+| — | Crash-loop demo: reproducible chaos, read-only Kubernetes evidence, crash loops remediated only on OOMKilled or measured memory pressure | Implemented and run against the real cluster |
 | — | Dashboard: backend-confirmed pipeline, approval controls, PR/deploy/verification status, incident timeline | Done |
 
 See [docs/RUNNING_ON_WINDOWS.md](docs/RUNNING_ON_WINDOWS.md) for exact commands and the

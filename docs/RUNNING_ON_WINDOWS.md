@@ -70,53 +70,65 @@ runbooks, routing (≥ 0.80 automatic, otherwise **Approve AI Patch Generation**
 and the **VALIDATED** proposal with its diff and 16 checks.
 `Invoke-RestMethod http://localhost:8001/recover` frees the memory; the alert clears.
 
-## 4. Full self-healing demo (Stages 3–4) on a disposable local cluster
+## 4. Full self-healing demo: Kubernetes crash loop → PR → deploy → verified recovery
 
-1. **Enable Kubernetes**: Docker Desktop → Settings → Kubernetes → *Enable Kubernetes* → Apply.
-   `kubectl config get-contexts` must list `docker-desktop`.
-2. **Create the demo environment** (builds the image, applies the namespace, the
-   repository's `deployment.yaml` with a 100Mi limit and a NodePort service, and
-   points Prometheus at the pod):
-   ```powershell
-   python scripts/k8s_demo.py setup
-   python scripts/k8s_demo.py status
+**Prerequisites (once):**
+1. Docker Desktop → Settings → Kubernetes → *Enable Kubernetes*. `kubectl config get-contexts` lists `docker-desktop`.
+2. The branch with Stages 3–4 must be merged into `main` (remediation PRs need its CI fix, and the
+   proposer's base file must equal `main`).
+3. `.env` (then restart the API and the worker; run **one** worker only):
    ```
-   Stop the local target app (terminal 1) so only the pod is monitored.
-3. **Configure `.env`** and restart the API and worker:
-   ```
-   SHADOW_MODE=false                       # shadow mode never deploys
+   GITHUB_TOKEN=...                      # contents, pull requests: write; actions: read
+   GITHUB_REPO=<owner>/<repo>            # this checkout's origin
+   SHADOW_MODE=false                     # shadow mode never deploys
+   REMEDIATION_REQUIRE_PR=true
+   REMEDIATION_REQUIRE_CI=true           # deploy only after GitHub Actions passed on the PR commit
    DEPLOY_MODE=kubectl
    DEPLOY_KUBE_CONTEXT=docker-desktop
    DEPLOY_ALLOWED_TARGETS=autofixops/autofixops-target-app
-   VERIFY_HEALTH_URL=http://localhost:30081/health
+   VERIFY_HEALTH_URL=kube-service://autofixops/target-app-nodeport:80/health
    VERIFY_STABILIZATION_SECONDS=60
-   # GitHub PR (recommended): a token with contents+pull-requests write on YOUR repo
-   GITHUB_TOKEN=...                        # or set it on the dashboard Settings page (stored encrypted)
-   GITHUB_REPO=<owner>/<repo>              # must be this checkout's origin
-   # ...or a local-only run without a PR:
-   # REMEDIATION_REQUIRE_PR=false
-   # Optional authenticated approvals:
-   # APPROVER_TOKENS=yourname:<a random string of 16+ characters>
+   CHAOS_K8S_ENABLED=true                # crash-loop button on the dashboard Chaos page
    ```
-   The dashboard system mode must be **ACTIVE** (not SHADOW / DISABLED).
-4. **Inject the failure**:
-   ```powershell
-   Invoke-RestMethod http://localhost:30081/health          # healthy
-   1..4 | ForEach-Object { Invoke-RestMethod http://localhost:30081/leak }
-   ```
-5. **Watch and approve** on `http://localhost:3000/incidents`:
-   alert → context → diagnosis → VALIDATED proposal → click **Approve remediation**.
-6. **GitHub**: AutoFixOps opens a PR containing exactly the validated diff. Review
-   and **merge it on GitHub without editing it** (an edited merge is refused).
-7. AutoFixOps sees the merge, patches the one limit with `kubectl` (dry run first),
-   waits for the rollout and verifies: deployment ready, pods healthy, `/health`
-   200, alert cleared and memory below 80% of the new limit, continuously for the
-   stabilization window → incident **RESOLVED**. If verification fails it restores
-   the previous limit and opens a revert PR.
-8. **Reset** for another run: `git pull` (main now has the new limit), then
-   `python scripts/k8s_demo.py setup` (re-applies the repository manifest), or
-   `python scripts/k8s_demo.py teardown` to remove everything and point
-   Prometheus back at port 8001.
+   The dashboard system mode must be **ACTIVE**.
+
+**Create the target in the cluster:**
+```powershell
+python scripts/k8s_demo.py setup     # image, namespace, chaos ConfigMap, deployment (100Mi), NodePort service
+python scripts/k8s_demo.py status
+```
+*Docker Desktop's kind-based cluster* (node `desktop-control-plane`) cannot see images built with
+`docker build`. Import the image once into the node (a temporary privileged debug pod, deleted afterwards):
+```powershell
+kubectl --context docker-desktop debug node/desktop-control-plane --image=busybox:1.36 --profile=sysadmin -- sleep 900
+docker save autofixops/target-app:latest | kubectl --context docker-desktop exec -i <node-debugger-pod> -- chroot /host ctr -n k8s.io images import -
+kubectl --context docker-desktop delete pod <node-debugger-pod>
+python scripts/k8s_demo.py setup     # again, now the pod starts
+```
+The kind node does not publish NodePorts on Windows either: `setup` attaches the Prometheus
+container to the `kind` Docker network and scrapes the node IP, and health checks go through the
+API server's service proxy (`kube-service://...`).
+
+**Demonstration (acceptance test):**
+1. Dashboard → **Incidents**: the *Kubernetes target* card shows **HEALTHY** (1/1 ready, 0 restarts, 100Mi).
+2. Dashboard → **Chaos** → *Inject crash loop* (or `python scripts/k8s_demo.py chaos crashloop`). The app
+   now needs ~110% of its memory limit at start-up (ConfigMap `target-app-chaos`, survives pod replacement).
+3. The pod becomes unhealthy: restarts climb; Kubernetes shows `OOMKilled`, or on nodes with swap
+   (Docker Desktop) liveness-probe kills (`exit 137`) and `CrashLoopBackOff`.
+4. Prometheus fires the memory/availability alerts; Alertmanager posts them; **one** incident is created.
+5. The incident page shows real telemetry, Kubernetes evidence (restarts, termination, events, logs),
+   runbooks, the Ollama diagnosis and the routing decision.
+6. The proposer offers only limits that leave verification headroom (e.g. 150Mi/200Mi for a ~110Mi need)
+   and stores a **VALIDATED** diff with all checks.
+7. Click **Approve remediation** (the exact proposal). AutoFixOps opens a PR with that diff only.
+8. Wait for **GitHub Actions** to pass on the PR, then **merge it on GitHub without editing it**.
+9. AutoFixOps sees the merge (polls every `REMEDIATION_PR_POLL_SECONDS`), checks the merged file and CI,
+   runs a server dry run, patches the one limit, waits for the rollout (new pod replaces the crashing one),
+   then verifies deployment, pods, health, alert and headroom for the stabilization window → **RESOLVED**.
+   If verification fails it restores the previous limit, opens a revert PR and marks the incident FAILED.
+
+**Reset for another run:** `git pull` (main now has the new limit; it must equal your working tree),
+`python scripts/k8s_demo.py chaos reset`, and to remove everything `python scripts/k8s_demo.py teardown`.
 
 ## 5. Tests
 
