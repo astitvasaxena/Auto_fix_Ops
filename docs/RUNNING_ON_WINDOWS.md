@@ -127,6 +127,25 @@ API server's service proxy (`kube-service://...`).
    then verifies deployment, pods, health, alert and headroom for the stabilization window → **RESOLVED**.
    If verification fails it restores the previous limit, opens a revert PR and marks the incident FAILED.
 
+**The three chaos faults (dashboard Chaos page, Kubernetes mode, or `k8s_demo.py chaos ...`).**
+Each one is a value in the ConfigMap `target-app-chaos` that the target app reads at start-up, plus
+an expiry (`CHAOS_TTL_MINUTES`, default 30); injection restarts the pod, so the fault is real and
+persists across restarts until it expires or is reset. The page never creates an incident: only
+Prometheus/Alertmanager do.
+
+| Fault | What happens in the pod | Detected by | What AutoFixOps does |
+|---|---|---|---|
+| Crash Loop (`crashloop`) | start-up needs the whole memory limit: OOMKilled at every start, CrashLoopBackOff, target down | TargetAppDown | memory limit increase (2x, the largest bounded value) after approval, PR, CI and merge; verified recovery |
+| Memory Leak (`memoryleak`) | memory grows 40 MB/min until OOMKilled, again after every restart | TargetAppMemoryLeak / HighMemoryUsage | refuses a larger limit (code-measured growth ⇒ LEAK_SUSPECTED: it would only delay the next kill) and leaves the incident to a human; recover with `chaos reset` |
+| CPU Spike (`cpuspike`) | CPU demand 140% of the CPU limit: pinned at the limit and throttled (degraded, not down) | HighCPUUsage (usage > 90% of the CPU limit for 1 min) | CPU limit increase (2x, real demand is hidden by throttling) after approval, PR, CI and merge; verified recovery |
+
+The CPU and leak faults, the expiry and the CPU-limit metric need the current target image and the
+HighCPUUsage rule: rebuild/import the image (see above) and reload Prometheus
+(`Invoke-WebRequest -Method Post http://localhost:9090/-/reload`).
+
+A remediation whose deployment or verification fails is rolled back and the incident is
+**ESCALATED** to a human (close it with a reason on the incident page once handled).
+
 **Reset for another run:** `git pull` (main now has the new limit; it must equal your working tree),
 `python scripts/k8s_demo.py chaos reset`, and to remove everything `python scripts/k8s_demo.py teardown`.
 

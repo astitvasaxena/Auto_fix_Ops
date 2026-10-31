@@ -460,6 +460,12 @@ Shown under the Stage 2 panel. Every remediation needs a human decision on the
    **RESOLVED**. Otherwise the previous value is restored and a revert PR is opened
    → incident **FAILED**.
 
+If the deployment or the recovery verification fails, the change is rolled back
+(and a revert PR opened) and the incident becomes **ESCALATED**: a human owns it
+and can close it with a reason. Memory that is still growing when the incident
+is built (a leak) never gets a larger limit: the proposal is refused with
+`LEAK_SUSPECTED`, because a larger limit only delays the next OOM kill.
+
 Steps that cannot run yet (no GitHub credentials, deployment disabled, shadow
 mode, target not allowlisted, cluster unreachable) show **Waiting: <reason>**
 with what to configure, change nothing, and can be retried with **Retry this
