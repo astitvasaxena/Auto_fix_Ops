@@ -218,6 +218,21 @@ def test_target_down_query_retrieves_availability_guidance():
     print(f"✅ PASS: Target-down query → {hits[0]['payload']['source_title']} ({hits[0]['score']:.3f})")
 
 
+def test_evidence_queries_retrieve_cpu_and_memory_guidance():
+    # A "target down" alert's own text outweighs the cause; the evidence-only query (production
+    # top_k 3 and min_score 0.35) must still reach the guidance the Stage 2 proposer requires.
+    from engine.ai_diagnostics import build_evidence_query, retrieve_runbook_evidence
+
+    store = _seeded_store()
+    starved = build_evidence_query({"telemetry": {"summary": {"cpu_peak": 0.49}}, "kubernetes": {"summary": {
+        "ready_pods": 0, "readiness_failures": 6, "restart_count": 0, "live_cpu_limit": "500m"}}})
+    leak = build_evidence_query({"telemetry": {"memory_growth_mib_per_min": 30.0}, "kubernetes": {"summary": {}}})
+    for query, expected in ((starved, "k8s-cpu-limits-throttling"), (leak, "k8s-oomkilled-memory-pressure")):
+        hits, status = retrieve_runbook_evidence(store, query, 3, 0.35)
+        assert status == "ok" and hits[0]["runbook_id"] == expected, (query, hits)
+    print("✅ PASS: evidence queries retrieve the CPU-throttling and memory guidance first")
+
+
 def test_results_carry_source_metadata_and_scores():
     hits = _top(_seeded_store(), "the app is down and health checks fail", k=EXPECTED_DOCUMENTS)
     assert len(hits) == EXPECTED_DOCUMENTS
