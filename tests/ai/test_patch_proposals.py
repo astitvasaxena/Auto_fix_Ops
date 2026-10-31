@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -35,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 import httpx
+import yaml
 from langchain_core.runnables import RunnableLambda
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -43,11 +45,16 @@ from sqlalchemy.pool import StaticPool
 from api.database import Base
 from api.models import Incident, IncidentStatus, PatchProposal, ProjectConfig, RemediationAudit, SystemConfig, SystemMode
 from engine import patch_diff, patch_proposer as pp, patch_safety
+from engine.patch_generator import parse_memory
 from engine.patch_diff import PatchDiffError, apply_unified_diff_strict, check_diff_policy, parse_unified_diff_strict
 
 REL = "kubernetes_integration/target_app/deployment.yaml"
 REAL_MANIFEST = REPO_ROOT / REL
-MANIFEST_LF = REAL_MANIFEST.read_bytes().decode("utf-8").replace("\r\n", "\n")
+# The proposer tests use a frozen copy of the target manifest (memory limit 100Mi, CPU 500m).
+# A merged remediation PR changes the real manifest; that must not change what these tests mean.
+# Only the tests that deliberately run against the real repository read REAL_MANIFEST.
+FIXTURE_MANIFEST = REPO_ROOT / "tests" / "fixtures" / "target_app_deployment.yaml"
+MANIFEST_LF = FIXTURE_MANIFEST.read_bytes().decode("utf-8").replace("\r\n", "\n")
 MEMORY_LINE = '            memory: "100Mi" # Very tight memory limit to ensure /leak triggers OOMKilled fast'
 CPU_LINE = '            cpu: "500m"'
 MIB = 1024 ** 2
@@ -104,6 +111,36 @@ def _decision(new_value="150Mi", decision="PROPOSE", fact_ids=("F3", "F4"),
             "decision": decision, "new_value": new_value, "decline_reason": decline_reason}
     body.update(extra)
     return json.dumps(body)
+
+
+def real_manifest_memory_limit() -> int:
+    """Current memory limit (bytes) of the REAL manifest, whatever a merged remediation set it to."""
+    doc = yaml.safe_load(REAL_MANIFEST.read_text(encoding="utf-8"))
+    return parse_memory(doc["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"])
+
+
+def real_manifest_report(**overrides):
+    """A report whose memory peak is 90% of the real manifest's current limit (for real-repo runs)."""
+    report = _report(**overrides)
+    report["incident_context"]["telemetry"]["summary"]["memory_peak"] = 0.9 * real_manifest_memory_limit()
+    return report
+
+
+class MenuStubLLM:
+    """Like StubLLM, but proposes the first value of whatever MENU the prompt offers."""
+
+    def __init__(self, rationale="The peak is close to the current limit; a bounded increase adds headroom."):
+        self.prompts, self.menus, self.rationale = [], [], rationale
+        self.runnable = RunnableLambda(self._call)
+
+    def _call(self, prompt):
+        text = str(prompt)
+        self.prompts.append(text)
+        resource, menu = re.search(r"MENU for the (memory|cpu) limit: ([^\n]+)", text).groups()
+        values = [v.strip() for v in menu.split(",")]
+        self.menus.append(values)
+        runbook = re.search(r"runbook_id ([a-z0-9-]+)\):", text).group(1)   # cite the runbook offered
+        return _decision(new_value=values[0], runbook_ids=(runbook,), rationale=self.rationale)
 
 
 class StubLLM:
@@ -1340,7 +1377,6 @@ def test_eligibility_boundaries():
     mem = lambda peak_mib: _nested(**{"incident_context.telemetry.summary.memory_peak": peak_mib * MIB})
     cpu = lambda cores: _cpu_report(incident_context={**_report()["incident_context"], "telemetry": {
         "available": True, "summary": {"memory_peak": 1.0, "cpu_peak": cores}}})
-    cpu_llm = lambda: StubLLM(_decision(new_value="750m", runbook_ids=("k8s-cpu-limits-throttling",), rationale=quiet))
     cases = [
         ("confidence exactly 0.80", dict(report=_report(confidence=0.80)), pp.VALIDATED, None),
         ("confidence 0.7999999", dict(report=_report(confidence=0.7999999)), pp.NOT_GENERATED, "LOW_CONFIDENCE"),
@@ -1353,10 +1389,17 @@ def test_eligibility_boundaries():
         ("cpu exactly 150%", dict(report=cpu(0.75)), pp.VALIDATED, None),
         ("cpu 150.2%", dict(report=cpu(0.751)), pp.NOT_GENERATED, "INSUFFICIENT_EVIDENCE"),
     ]
+    menus = {}
     for name, kw, status, code in cases:
-        llm = cpu_llm() if "cpu" in name else StubLLM(_decision(rationale=quiet))
-        result, llm, SF, _ = run_case(llm=llm, **kw)
+        result, llm, SF, _ = run_case(llm=MenuStubLLM(rationale=quiet), **kw)
         _expect(result, SF, status, code, llm, status == pp.VALIDATED)
+        if llm.menus:
+            menus[name] = llm.menus[0]
+    # Values that Stage 4 verification would reject (peak >= 80% of the new limit) are never offered.
+    assert menus["memory exactly 80%"] == ["125Mi", "150Mi", "200Mi"], menus
+    assert menus["memory exactly 150%"] == ["200Mi"], menus
+    assert menus["cpu exactly 80%"] == ["625m", "750m", "1"], menus
+    assert menus["cpu exactly 150%"] == ["1"], menus
     print(f"✅ PASS: confidence 0.80 and utilisation 80%/150% boundaries for memory and CPU ({len(cases)} cases)")
 
 
@@ -1726,9 +1769,9 @@ def test_real_working_tree_unchanged():
             created.append(self.name)
 
     SF = _factory()
-    incident_id = _add_incident(SF)
+    incident_id = _add_incident(SF, report=real_manifest_report())
     with patch.object(patch_diff.tempfile, "TemporaryDirectory", Recording):
-        result = pp.run_for_incident(SF, incident_id, REPO_ROOT, llm=StubLLM().runnable, env={}, settings=FAST)
+        result = pp.run_for_incident(SF, incident_id, REPO_ROOT, llm=MenuStubLLM().runnable, env={}, settings=FAST)
     assert result["status"] == pp.VALIDATED, (result["reason_code"], result.get("reason_detail"))
     assert _tree_state(target_dir) == before, "the real manifest directory changed"
     assert created and not any(os.path.exists(p) for p in created)

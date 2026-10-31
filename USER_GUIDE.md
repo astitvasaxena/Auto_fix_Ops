@@ -166,7 +166,7 @@ recommendations can avoid it.
 |---|---|
 | Multi-cluster federation | One cluster per project, one project per AutoFixOps install. |
 | Auto-merge | Intentional. The point of AutoFixOps is that **you** merge. |
-| Kubectl write actions to the live cluster | All changes go through a PR. AutoFixOps does **not** talk to your cluster's write API. |
+| Unbounded kubectl write actions | Only Stage 4 writes to a cluster, and only one approved, validated resource limit, to an allowlisted Deployment, after a human approval and (by default) a merged PR. It is off unless `DEPLOY_MODE=kubectl`. |
 | Database migrations as a remediation action | Too risky for autonomous diagnosis. |
 | Diagnosing application logic bugs | We diagnose **infrastructure** symptoms (resources, lifecycle), not "this query is slow" or "this auth check is wrong". |
 | Replacing your on-call engineer | This is an assistant. A human still owns the incident. |
@@ -184,6 +184,14 @@ recommendations can avoid it.
   and user agent only — no user identity is invented. Run the API on
   `localhost` or a private network, and **do not deploy it publicly** until
   authentication and role-based authorization are added.
+- **Stage 3–4 approvals** (approve / reject / close / retry a remediation) are
+  stricter: with `APPROVER_TOKENS=name:token` set they require that bearer token
+  and record `name` as the authenticated approver; without it they are accepted
+  **only from this machine** (loopback) and recorded as unauthenticated.
+- Only memory/CPU limit increases are automated; other actions are escalated.
+- The local target app (a Windows process) has no real memory limit. Real
+  enforcement, rollout and verification need the Kubernetes demo
+  (`scripts/k8s_demo.py`, see `docs/RUNNING_ON_WINDOWS.md`).
 
 ---
 
@@ -417,7 +425,8 @@ stored diagnosis confidence (one fixed threshold of **0.80**):
 Both routes run the same proposer: the local model may only pick a value
 from a code-generated menu (or decline), and Python builds the diff and
 validates it in a temporary sandbox. Only a `VALIDATED` proposal shows a
-diff. Nothing is applied, committed, pushed or deployed — that is Stage 3.
+diff. Stage 2 itself applies, commits, pushes and deploys nothing — that
+is the job of the panel below it (Stages 3–4).
 The model is consulted at most once per diagnosis version on every path
 (worker, API retry, CLI): once it has decided (`VALIDATED`, `REJECTED` or a
 decline), later runs return `ALREADY_GENERATED`. A `FAILED` run, a refusal
@@ -427,6 +436,38 @@ A `PATCH_PROPOSAL_MIN_CONFIDENCE` or project `confidence_threshold` other
 than 0.80 is refused as `CONFIG_INVALID`. Set `PATCH_PROPOSALS_AUTO=false`
 to stop automatic generation (the panel then shows a Generate button).
 Approvals are unauthenticated — see the local-demo limitation in section 5.
+
+**Approval, Pull Request, Deployment & Verification panel (Stages 3–4).**
+Shown under the Stage 2 panel. Every remediation needs a human decision on the
+*exact* validated proposal, whatever the confidence:
+
+1. **Approve remediation** (or **Reject**, which needs a reason). Only the
+   incident's latest, integrity-checked `VALIDATED` proposal built from the
+   current diagnosis can be approved; the kill switch refuses approvals.
+2. **Pull request** — AutoFixOps creates branch `autofixops/remediation-<id>`,
+   commits the file rebuilt from the stored diff (hash-checked against the
+   proposal) and opens a PR whose description lists the incident, diagnosis,
+   evidence, diff, validation results and approval. Shadow mode makes it a draft.
+   Repeated clicks or retries reuse the same PR.
+3. **Merge** — you merge on GitHub. A merge whose file differs from the approved
+   patch is refused (never deployed).
+4. **Controlled deployment** — `kubectl` patches the one limit of the allowlisted
+   Deployment (server dry run first; the patch is refused atomically if the live
+   value is not the one the proposal saw). The previous container spec is recorded.
+5. **Recovery verification** — every `VERIFY_INTERVAL_SECONDS` the deployment,
+   pods, `VERIFY_HEALTH_URL`, the incident's alert and memory/CPU headroom are
+   checked; all must stay green for `VERIFY_STABILIZATION_SECONDS` →
+   **RESOLVED**. Otherwise the previous value is restored and a revert PR is opened
+   → incident **FAILED**.
+
+Steps that cannot run yet (no GitHub credentials, deployment disabled, shadow
+mode, target not allowlisted, cluster unreachable) show **Waiting: <reason>**
+with what to configure, change nothing, and can be retried with **Retry this
+step**. **Close incident** records a manual resolution with a reason when no
+automated remediation is wanted. The panel ends with the full incident timeline
+(alert, status changes, proposal, approval, PR, merge, deployment, verification).
+The pipeline strip at the top marks a stage completed only when the backend has
+recorded it (chaos-created incidents show Prometheus/AlertManager as skipped).
 
 ### `/metrics` — pipeline health
 - **Cards:** total incidents, resolved, escalated, failed.
@@ -500,6 +541,18 @@ GET  /api/v1/patch-proposals/{proposal_id}                    # also /diff and /
 # No authentication: local demonstration only — do not expose publicly without authN/authZ.
 ```
 CLI: `python scripts/propose_patch.py <incident_id>` and `--show <incident_id>`.
+
+### Remediation (Stages 3–4 — approval, PR, deployment, verification)
+```bash
+GET  /api/v1/incidents/{incident_id}/remediation           # run, config summary, timeline (read-only)
+POST /api/v1/incidents/{incident_id}/remediation/approve   # {"proposal_id": "...", "reason": "..."}
+POST /api/v1/incidents/{incident_id}/remediation/reject    # {"proposal_id": "...", "reason": "required"}
+POST /api/v1/incidents/{incident_id}/remediation/advance   # retry / re-check the current step
+POST /api/v1/incidents/{incident_id}/close                 # {"reason": "..."} manual resolution
+# JSON only. With APPROVER_TOKENS set: header "Authorization: Bearer <token>"; otherwise loopback only.
+```
+Settings: `REMEDIATION_REQUIRE_PR`, `DEPLOY_MODE`, `DEPLOY_KUBE_CONTEXT`,
+`DEPLOY_ALLOWED_TARGETS`, `VERIFY_HEALTH_URL`, `VERIFY_*_SECONDS` (see `.env.example`).
 
 ### Roll back a fix
 ```bash

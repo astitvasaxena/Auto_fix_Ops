@@ -15,6 +15,10 @@ async function fetchAPI(path, options = {}) {
   return res.json();
 }
 
+function authHeader(token) {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export const api = {
   // System
   getStatus: () => fetchAPI('/api/v1/status'),
@@ -44,6 +48,29 @@ export const api = {
   }),
   rejectPatchGeneration: (id, reason) => fetchAPI(`/api/v1/incidents/${id}/patch-proposals/reject`, {
     method: 'POST', body: JSON.stringify({ reason: reason || null })
+  }),
+
+  // Stages 3-4: human approval of a validated proposal -> GitHub PR -> controlled deployment ->
+  // recovery verification. The browser sends only the proposal id it reviewed (and a reason);
+  // the server re-checks everything. `token` is the optional approver token (APPROVER_TOKENS).
+  getRemediation: (id) => fetchAPI(`/api/v1/incidents/${id}/remediation`),
+  approveRemediation: (id, proposalId, reason, token) => fetchAPI(`/api/v1/incidents/${id}/remediation/approve`, {
+    method: 'POST', headers: authHeader(token), body: JSON.stringify({ proposal_id: proposalId, reason: reason || null })
+  }),
+  rejectRemediation: (id, proposalId, reason, token) => fetchAPI(`/api/v1/incidents/${id}/remediation/reject`, {
+    method: 'POST', headers: authHeader(token), body: JSON.stringify({ proposal_id: proposalId, reason })
+  }),
+  advanceRemediation: (id, token) => fetchAPI(`/api/v1/incidents/${id}/remediation/advance`, {
+    method: 'POST', headers: authHeader(token), body: '{}'
+  }),
+  closeIncident: (id, reason, token) => fetchAPI(`/api/v1/incidents/${id}/close`, {
+    method: 'POST', headers: authHeader(token), body: JSON.stringify({ reason })
+  }),
+
+  // Kubernetes target health (read-only) and crash-loop chaos (opt-in, never creates an incident)
+  getKubernetesTarget: () => fetchAPI('/api/v1/target/kubernetes'),
+  injectKubernetesChaos: (fault, confirmation, token) => fetchAPI('/api/v1/chaos/kubernetes', {
+    method: 'POST', headers: authHeader(token), body: JSON.stringify({ fault, confirmation })
   }),
 
   // Metrics

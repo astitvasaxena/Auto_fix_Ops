@@ -1,0 +1,12 @@
+[
+  {
+    "targets": [
+      "host.docker.internal:8001"
+    ],
+    "labels": {
+      "environment": "local",
+      "app": "target-app",
+      "service": "target-app"
+    }
+  }
+]

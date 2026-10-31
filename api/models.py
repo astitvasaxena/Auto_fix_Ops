@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Enum, JSON, ForeignKey, Float, Text, Integer, Boolean, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, Enum, JSON, ForeignKey, Float, Text, Integer, Boolean, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
@@ -14,7 +14,7 @@ VALID_TRANSITIONS = {
     "CONTEXT_BUILT":    {"DIAGNOSED", "FAILED"},
     "DIAGNOSED":        {"POLICY_APPROVED", "ESCALATED", "FAILED"},
     "POLICY_APPROVED":  {"REMEDIATING", "FAILED"},
-    "REMEDIATING":      {"PENDING_PR_MERGE", "FAILED"},
+    "REMEDIATING":      {"PENDING_PR_MERGE", "VERIFIED", "FAILED"},  # VERIFIED: PR step skipped by config
     "PENDING_PR_MERGE": {"VERIFIED", "FAILED"},
     "VERIFIED":         {"RESOLVED", "FAILED"},
     "ESCALATED":        {"POLICY_APPROVED", "RESOLVED"},  # Human can approve or resolve
@@ -319,3 +319,48 @@ class PatchRoutingDecision(Base):
     audit_log = Column(JSON, nullable=True)             # append-only list of events
     created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, nullable=True)
+
+
+class RemediationRun(Base):
+    """
+    Stages 3-4: one approved remediation of one VALIDATED Stage 2 proposal.
+
+    stage: APPROVED -> PR_OPEN -> READY_TO_DEPLOY -> DEPLOYING -> VERIFYING -> RESOLVED
+           (APPROVED -> READY_TO_DEPLOY when the PR step is disabled by config)
+           REJECTED | FAILED | ROLLED_BACK | ROLLBACK_FAILED are final.
+    A step that cannot run yet (e.g. GitHub or deployment not configured, PR not
+    merged) leaves the stage unchanged and records blocked_code; it can be retried.
+    Every human decision and step result is appended to audit_log.
+    deploy_lock is True only while this run may change the cluster; a partial
+    unique index allows one such run per target at a time.
+    """
+    __tablename__ = "remediation_runs"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", name="uq_remediation_proposal"),
+        Index("uq_remediation_deploy_lock", "target_key", unique=True,
+              postgresql_where=Column("deploy_lock").is_(True), sqlite_where=Column("deploy_lock").is_(True)),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id"), nullable=False, index=True)
+    proposal_id = Column(UUID(as_uuid=True), ForeignKey("patch_proposals.id"), nullable=False)
+    report_sha256 = Column(String(64), nullable=False)          # diagnosis version that was approved
+    diff_sha256 = Column(String(64), nullable=False)            # exact diff that was approved
+    target_key = Column(String(255), nullable=False)            # namespace/Deployment/name
+    stage = Column(String(24), nullable=False, index=True)
+    step_token = Column(String(64), nullable=True)              # claim for the step in progress
+    step_started_at = Column(DateTime, nullable=True)
+    blocked_code = Column(String(48), nullable=True)
+    blocked_detail = Column(Text, nullable=True)
+    decided_by = Column(JSON, nullable=True)                    # approver as verified; no invented identity
+    decision_reason = Column(Text, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    github = Column(JSON, nullable=True)                        # mode, branch, pr number/url/state, shas
+    deployment = Column(JSON, nullable=True)                    # mode, context, previous snapshot, patch, output
+    verification = Column(JSON, nullable=True)                  # rounds of checks with timestamps
+    rollback = Column(JSON, nullable=True)
+    deploy_lock = Column(Boolean, nullable=True)
+    audit_log = Column(JSON, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)

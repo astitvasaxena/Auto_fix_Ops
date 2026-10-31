@@ -1,5 +1,6 @@
 import os
 import hashlib
+import uuid
 import time
 from typing import Optional
 from fastapi import FastAPI, Depends, Request, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -24,9 +25,11 @@ from .config_helpers import (
 from workers.tasks import build_incident_context, execute_remediation
 from .events import ws_manager, redis_listener, emit_sync
 from .patch_proposals import router as patch_proposals_router
+from .remediation import router as remediation_router
 
 app = FastAPI(title="AutoFixOps API Gateway")
 app.include_router(patch_proposals_router)   # Stage 2: AI patch proposals (proposal only, never applied)
+app.include_router(remediation_router)       # Stages 3-4: approval, GitHub PR, controlled deployment, verification
 
 # CORS — allow dashboard direct access
 app.add_middleware(
@@ -38,15 +41,31 @@ app.add_middleware(
 )
 
 
+_redis_listener_task = None
+
+
 @app.on_event("startup")
 async def on_startup():
+    global _redis_listener_task
     logger.info("Initializing relational database schema...")
     init_relational_db()
     
     # Start Redis WebSocket listener
-    asyncio.create_task(redis_listener(ws_manager))
+    _redis_listener_task = asyncio.create_task(redis_listener(ws_manager))
     
     logger.info("AutoFixOps API Gateway started successfully.")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global _redis_listener_task
+    if _redis_listener_task and not _redis_listener_task.done():
+        _redis_listener_task.cancel()
+        try:
+            await _redis_listener_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("AutoFixOps API Gateway stopped.")
 
 
 # Statuses that end an incident for ingestion de-duplication purposes.
@@ -56,6 +75,16 @@ _CLOSED_STATUSES = [
     IncidentStatus.RESOLVED, IncidentStatus.FAILED,
     IncidentStatus.HUMAN_APPROVED, IncidentStatus.HUMAN_REJECTED,
 ]
+
+
+# Alerts about the same target that describe one outage (memory pressure turning into restarts).
+_ALERT_GROUPS = (("TargetAppDown", "TargetAppCrashLoop", "TargetAppMemoryLeak", "HighMemoryUsage"),)
+
+
+def _incident_source(incident) -> str:
+    """How the incident was created: "chaos_injection" (POST /chaos/inject creates it directly,
+    without Prometheus/Alertmanager) or "alertmanager" (webhook from a firing alert rule)."""
+    return "chaos_injection" if (incident.raw_payload_cache or {}).get("chaos") else "alertmanager"
 
 
 def generate_dedup_key(alert: dict, window_seconds: int = 120) -> str:
@@ -115,13 +144,19 @@ async def receive_alert(
                 logger.info(f"[ALERTMANAGER RESOLVED] No active incident found for {alert_name}.")
             continue
 
-        # Prevent duplicate processing of the same active incident
+        # Prevent duplicate processing of the same active incident. Alerts in one group describe
+        # the same outage (a crash-looping target is both "down" and "restarting"): one incident.
+        # Only a recent incident counts: one left open for days (e.g. stuck in a legacy state)
+        # must not swallow a new outage.
+        same_outage = next((g for g in _ALERT_GROUPS if alert_name in g), (alert_name,))
+        recent = datetime.utcnow() - timedelta(hours=float(os.getenv("DEDUP_ACTIVE_HOURS", "6")))
         active_incident = (
             db.query(Incident)
             .filter(
-                Incident.alert_name == alert_name,
+                Incident.alert_name.in_(same_outage),
                 Incident.status.notin_(_CLOSED_STATUSES),
                 Incident.project_id == default_project_id,
+                Incident.created_at >= recent,
             )
             .order_by(Incident.created_at.desc())
             .first()
@@ -203,6 +238,8 @@ def list_incidents(
                 "diagnosed_by": i.diagnosed_by,
                 "created_at": i.created_at.isoformat() if i.created_at else None,
                 "resolved_at": i.resolved_at.isoformat() if i.resolved_at else None,
+                "source": _incident_source(i),
+                "status_timeline": i.status_timeline or [],
             }
             for i in incidents
         ],
@@ -214,10 +251,11 @@ def list_incidents(
 # ════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/incidents/{incident_id}/context")
-def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
+def get_incident_context(incident_id: uuid.UUID, db: Session = Depends(get_db)):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)
 
     # Fetch MongoDB context
     mongo_ctx = incident_contexts_collection.find_one(
@@ -227,7 +265,7 @@ def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
     # Fetch remediation audits
     audits = (
         db.query(RemediationAudit)
-        .filter(RemediationAudit.incident_id == incident_id)
+        .filter(RemediationAudit.incident_id == incident.id)
         .all()
     )
 
@@ -245,6 +283,13 @@ def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
             "policy_decision": (incident.raw_payload_cache or {}).get("policy_decision"),
             "resolved_target": incident.resolved_target,
             "created_at": incident.created_at.isoformat() if incident.created_at else None,
+            "resolved_at": incident.resolved_at.isoformat() if incident.resolved_at else None,
+            "source": _incident_source(incident),
+            "status_timeline": incident.status_timeline or [],
+            # Code-collected Kubernetes evidence captured when the context was built.
+            "kubernetes": ((incident.raw_payload_cache or {}).get("raw_context") or {}).get("kubernetes"),
+            "telemetry_source": (((incident.raw_payload_cache or {}).get("raw_context") or {})
+                                 .get("telemetry") or {}).get("source"),
         },
         "telemetry_context": mongo_ctx,
         "remediation_audits": [
@@ -269,15 +314,26 @@ def get_incident_context(incident_id: str, db: Session = Depends(get_db)):
 # ════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/escalations/{incident_id}/approve")
-def approve_escalation(incident_id: str, db: Session = Depends(get_db)):
+def approve_escalation(incident_id: uuid.UUID, db: Session = Depends(get_db)):
     incident = db.query(Incident).filter(Incident.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)
 
     if incident.status != IncidentStatus.ESCALATED:
         raise HTTPException(
             status_code=409,
             detail=f"Incident is in state {incident.status.value}, not ESCALATED.",
+        )
+
+    # An incident escalated by a Stage 3 rejection must not be remediated through this legacy,
+    # unvalidated path; it can only be closed by a human (POST /api/v1/incidents/{id}/close).
+    from .models import RemediationRun
+    if db.query(RemediationRun).filter(RemediationRun.incident_id == incident.id).first():
+        raise HTTPException(
+            status_code=409,
+            detail="REMEDIATION_REJECTED: a human rejected this incident's validated proposal; "
+                   "close the incident instead of using the legacy escalation path.",
         )
 
     # Build verdict from stored diagnosis
@@ -630,7 +686,11 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
             response_code = resp.status_code
         logger.info(f"[CHAOS] Injected {fault_type} via {url} → {response_code}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to reach target: {str(e)}")
+        CHAOS_RATE_LIMIT.pop(rate_key, None)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach target at {url}: {str(e)}. Target application on port 8001 may be offline or stopped."
+        )
 
     # Create an incident so the remediation pipeline picks it up
     fault_to_alert = {
@@ -676,6 +736,7 @@ async def inject_chaos(request: Request, db: Session = Depends(get_db)):
 
     return {
         "status": "injected",
+        "incident_id": str(incident.id),
         "fault_type": fault_type,
         "target": f"{target_url}{endpoint}",
         "response_code": response_code,
@@ -824,6 +885,179 @@ def delete_service_account(db: Session = Depends(get_db)):
 
     logger.info("[SERVICE ACCOUNT] Deleted. Falling back to .env token.")
     return {"status": "deleted", "message": "Service account removed. System will use .env fallback."}
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 13: Incident Debug Trace
+# ════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/incidents/{incident_id}/debug")
+def get_incident_debug(incident_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Returns the pre-diagnosis raw context, AI-prepared context, and diagnosis trace.
+
+    Includes:
+      - raw_context: the original context built before diagnosis (Task 1).
+      - ai_ready_context: the context prepared for the AI with RAG & prompt format (Task 2).
+      - debug_available: whether the requested data actually exists.
+      - messages: status explanations if any part of the data is pending or missing.
+      - teacher_summary: clear, readable comparison of pre-diagnosis vs post-diagnosis.
+    """
+    from engine.debug_trace import load_trace, is_debug_enabled
+
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)   # string form for trace files and the context store
+
+    raw_payload = incident.raw_payload_cache or {}
+    trace = load_trace(incident_id)
+
+    # 1. Resolve raw_context (captured in Task 1 before diagnosis)
+    raw_context = raw_payload.get("raw_context")
+    if not raw_context and trace:
+        raw_context = trace.get("raw_context") or (
+            trace.get("stages", {}).get("build_context", {}).get("context")
+        )
+
+    # Fallback to MongoDB if present
+    mongo_ctx = None
+    try:
+        mongo_ctx = incident_contexts_collection.find_one(
+            {"incident_id": incident_id}, {"_id": 0}
+        )
+    except Exception:
+        pass
+
+    if not raw_context and mongo_ctx:
+        raw_context = mongo_ctx
+
+    # 2. Resolve ai_ready_context (assembled for the LLM)
+    ai_ready_context = None
+    if trace and "context" in trace.get("stages", {}):
+        ai_ready_context = trace["stages"]["context"].get("incident_context")
+    elif incident.ai_report and isinstance(incident.ai_report, dict):
+        ai_ready_context = incident.ai_report.get("incident_context")
+
+    debug_available = bool(raw_context or ai_ready_context or trace)
+
+    # 3. Informative status messages
+    messages = {}
+    if not raw_context:
+        messages["raw_context"] = "Raw context not found. Incident may still be in INGESTED state or context collection failed."
+    else:
+        messages["raw_context"] = "Successfully captured in build_incident_context before diagnosis began."
+
+    if not ai_ready_context:
+        if incident.status == IncidentStatus.CONTEXT_BUILT:
+            messages["ai_ready_context"] = "AI diagnosis has not run yet. Incident is currently in CONTEXT_BUILT state."
+        elif incident.status == IncidentStatus.INGESTED:
+            messages["ai_ready_context"] = "Pipeline has not reached AI diagnosis stage yet."
+        else:
+            messages["ai_ready_context"] = "AI analysis context not recorded (resolved by rule engine or legacy fallback)."
+    else:
+        messages["ai_ready_context"] = "Successfully assembled with runbook RAG context and processed by the LLM."
+
+    if not trace:
+        messages["trace"] = "Trace file not found on disk. Ensure DEBUG_PROMPTS=true is in .env and Celery worker was restarted."
+    else:
+        messages["trace"] = "Full prompt trace loaded from debug_traces/<incident_id>.json."
+
+    # 4. Clean teacher summary
+    fault_type = (
+        raw_payload.get("fault_type")
+        or (raw_context.get("chaos", {}) if isinstance(raw_context, dict) else {}).get("fault_type", "unavailable")
+    )
+    target_pod = (
+        (raw_context.get("target", {}) if isinstance(raw_context, dict) else {}).get("pod")
+        or (raw_context.get("target_pod") if isinstance(raw_context, dict) else "unavailable")
+    )
+    telemetry_present = (
+        (raw_context.get("telemetry", {}) if isinstance(raw_context, dict) else {}).get("cpu_available", False)
+        if isinstance(raw_context, dict) else False
+    )
+
+    teacher_summary = {
+        "incident_id": str(incident.id),
+        "current_status": incident.status.value,
+        "phase_1_before_diagnosis": {
+            "stage_name": "build_incident_context",
+            "captured_before_ai": bool(raw_context),
+            "alert_name": incident.alert_name,
+            "severity": incident.severity,
+            "fault_type": fault_type,
+            "target_pod": target_pod,
+            "target_url": raw_payload.get("target_url") or "unavailable",
+            "telemetry_collected": telemetry_present,
+            "raw_context_persisted": bool(raw_context),
+        },
+        "phase_2_ai_diagnosis": {
+            "stage_name": "diagnose_incident",
+            "diagnosis_status": "COMPLETED" if incident.status not in (IncidentStatus.INGESTED, IncidentStatus.CONTEXT_BUILT) else "PENDING",
+            "diagnosed_by": incident.diagnosed_by or "pending",
+            "classification": incident.diagnosis_classification or "pending",
+            "confidence": incident.diagnosis_confidence,
+            "has_ai_report": bool(incident.ai_report),
+            "proposed_action": (incident.ai_report or {}).get("proposed_action", {}).get("type") if incident.ai_report else "pending",
+        },
+    }
+
+    return {
+        "incident_id": str(incident.id),
+        "status": incident.status.value,
+        "debug_available": debug_available,
+        "debug_prompts_enabled": is_debug_enabled(),
+        "messages": messages,
+        "teacher_summary": teacher_summary,
+        "raw_context": raw_context,
+        "ai_ready_context": ai_ready_context,
+        "trace": trace,
+        "db_summary": {
+            "status": incident.status.value,
+            "diagnosed_by": incident.diagnosed_by,
+            "classification": incident.diagnosis_classification,
+            "confidence": incident.diagnosis_confidence,
+            "reasoning": incident.diagnosis_reasoning,
+            "ai_report": incident.ai_report,
+            "status_timeline": incident.status_timeline,
+        },
+        "telemetry_context": mongo_ctx or (raw_context.get("metrics") if isinstance(raw_context, dict) else None),
+    }
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT 14: Dedicated Pre-Diagnosis Context Viewer
+# ════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/incidents/{incident_id}/pre-diagnosis-context")
+def get_pre_diagnosis_context(incident_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Simple, dedicated endpoint to inspect only the pre-diagnosis incident context."""
+    from engine.debug_trace import load_trace
+
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found.")
+    incident_id = str(incident.id)   # string form for trace files and the context store
+
+    raw_payload = incident.raw_payload_cache or {}
+    raw_context = raw_payload.get("raw_context")
+    if not raw_context:
+        trace = load_trace(incident_id)
+        if trace:
+            raw_context = trace.get("raw_context")
+
+    if not raw_context:
+        try:
+            raw_context = incident_contexts_collection.find_one({"incident_id": incident_id}, {"_id": 0})
+        except Exception:
+            pass
+
+    return {
+        "incident_id": str(incident.id),
+        "status": incident.status.value,
+        "context_available": bool(raw_context),
+        "stage": "PRE_DIAGNOSIS (Captured before AI Diagnosis)",
+        "raw_context": raw_context or "Not yet captured or missing",
+    }
 
 
 # ════════════════════════════════════════════════════════════

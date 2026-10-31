@@ -22,17 +22,18 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # ─── Local AutoFixOps target app ─────────────────────────────
-  # Prometheus runs in Docker, so Docker Desktop's host gateway reaches
-  # the target process exposed on the Windows host.
+  # ─── AutoFixOps target app ───────────────────────────────────
+  # Prometheus runs in Docker, so Docker Desktop's host gateway reaches the
+  # target on the Windows host. The target address lives in
+  # targets/target_app.json so the same job (and the same alert rules) can
+  # watch either the local process (host.docker.internal:8001, default) or the
+  # Kubernetes demo pod via its NodePort (host.docker.internal:30081).
+  # Switch with: python scripts/k8s_demo.py target local|k8s
   - job_name: 'autofixops-target'
     scheme: http
     scrape_interval: 15s
     scrape_timeout: 10s
     metrics_path: /metrics
-    static_configs:
-      - targets: ['host.docker.internal:8001']
-        labels:
-          environment: 'local'
-          app: 'target-app'
-          service: 'target-app'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/*.json']
+        refresh_interval: 15s

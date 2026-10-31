@@ -1,0 +1,22 @@
+# Demo-only Service: exposes the target pod on the host at port 30081 so that
+# the docker-compose Prometheus (via host.docker.internal) can scrape it and
+# Stage 4 verification can call its /health endpoint. Docker Desktop's
+# Kubernetes publishes NodePorts on localhost.
+apiVersion: v1
+kind: Service
+metadata:
+  name: target-app-nodeport
+  namespace: autofixops
+  labels:
+    app: target-app
+    system: autofixops
+spec:
+  type: NodePort
+  selector:
+    app: target-app
+    system: autofixops
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+      nodePort: 30081

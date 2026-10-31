@@ -11,6 +11,10 @@ build/
 
 # Data
 qdrant_data/
+debug_traces/
+powershell.cmd
+incident_debug.json
+scratch/
 *.db
 *.sqlite3
 

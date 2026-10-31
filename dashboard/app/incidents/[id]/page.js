@@ -4,54 +4,37 @@ import { useParams, useRouter } from 'next/navigation';
 import { api } from '../../../lib/api';
 import { formatConfidence } from '../../../lib/remediation.mjs';
 import AIRemediationPanel from '../../../components/AIRemediationPanel';
+import RemediationPanel from '../../../components/RemediationPanel';
+import PipelineFlow from '../../../components/PipelineFlow';
 
-const PIPELINE_STAGES = [
-  { key: 'INGESTED', label: 'Ingest', icon: '📥' },
-  { key: 'CONTEXT_BUILT', label: 'Context', icon: '🔍' },
-  { key: 'DIAGNOSED', label: 'Diagnosis', icon: '🧠' },
-  { key: 'POLICY_APPROVED', label: 'Policy', icon: '🛡' },
-  { key: 'PENDING_PR_MERGE', label: 'PR', icon: '🔧' },
-  { key: 'VERIFIED', label: 'Verify', icon: '✅' },
-  { key: 'RESOLVED', label: 'Resolved', icon: '🎯' },
-];
-
-const STATUS_ORDER = {
-  INGESTED: 0, CONTEXT_BUILT: 1, DIAGNOSED: 2, POLICY_APPROVED: 3,
-  REMEDIATING: 3.5, PENDING_PR_MERGE: 4, VERIFIED: 5, RESOLVED: 6,
-  FAILED: -1, ESCALATED: -2,
-};
-
-function PipelineFlow({ status }) {
-  const currentIdx = STATUS_ORDER[status] ?? -1;
-  const isFailed = status === 'FAILED';
-  const isEscalated = status === 'ESCALATED';
-
+function KubernetesEvidence({ evidence }) {
+  if (!evidence) return null;
+  const label = { fontSize: 12, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' };
+  if (!evidence.available) {
+    return <div className="card mb-16 text-sm text-muted">Kubernetes evidence: not collected ({evidence.reason})</div>;
+  }
+  const s = evidence.summary || {};
   return (
-    <div className="pipeline-flow">
-      {PIPELINE_STAGES.map((stage, i) => {
-        let nodeClass = '';
-        let labelClass = '';
-        if (isFailed || isEscalated) {
-          nodeClass = i <= Math.abs(currentIdx) ? 'failed' : '';
-          labelClass = i <= Math.abs(currentIdx) ? 'failed' : '';
-        } else if (i < currentIdx) {
-          nodeClass = 'completed';
-          labelClass = 'completed';
-        } else if (i === Math.floor(currentIdx)) {
-          nodeClass = 'active';
-          labelClass = 'active';
-        }
-
-        return (
-          <div key={stage.key} style={{ display: 'flex', alignItems: 'center' }}>
-            {i > 0 && <div className={`pipeline-connector ${i <= currentIdx ? 'completed' : ''}`} />}
-            <div className="pipeline-step">
-              <div className={`pipeline-node ${nodeClass}`}>{stage.icon}</div>
-              <div className={`pipeline-label ${labelClass}`}>{stage.label}</div>
-            </div>
-          </div>
-        );
-      })}
+    <div className="card mb-16">
+      <div style={label}>Kubernetes evidence · collected by code at {new Date(evidence.collected_at).toLocaleTimeString()}</div>
+      <div className="text-sm" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+        <div><div className="text-muted">Pod state</div><span className="mono" style={{ color: s.crash_loop ? 'var(--error)' : undefined }}>
+          {s.waiting_reason || (s.ready_pods === s.pods ? 'Ready' : 'Not ready')}</span></div>
+        <div><div className="text-muted">Restarts</div><span className="mono">{s.restart_count}</span></div>
+        <div><div className="text-muted">Last termination</div><span className="mono">{s.last_termination_reason || '—'}
+          {s.last_exit_code != null && ` (exit ${s.last_exit_code})`}</span></div>
+        <div><div className="text-muted">Live limits</div><span className="mono">{s.live_memory_limit} / {s.live_cpu_limit}</span></div>
+      </div>
+      {evidence.events?.length > 0 && (
+        <ul style={{ margin: '10px 0 0', paddingLeft: 18, fontSize: 13, color: 'var(--text-secondary)' }}>
+          {evidence.events.map((e, i) => <li key={i}><span className="mono">{e.reason}</span> ×{e.count ?? 1} — {e.message}</li>)}
+        </ul>
+      )}
+      {evidence.logs_previous_container?.length > 0 && (
+        <pre className="mono" style={{ marginTop: 10, fontSize: 12, background: 'var(--bg-secondary)', padding: 8, borderRadius: 6, whiteSpace: 'pre-wrap' }}>
+          {evidence.logs_previous_container.join('\n')}
+        </pre>
+      )}
     </div>
   );
 }
@@ -213,6 +196,7 @@ export default function IncidentDetailPage() {
   const [rollingBack, setRollingBack] = useState(false);
   const [toast, setToast] = useState(null);
   const [eventCount, setEventCount] = useState(0);
+  const [remediation, setRemediation] = useState(null);   // Stages 3-4 view (setter is stable)
 
   useEffect(() => {
     const load = () => {
@@ -277,17 +261,25 @@ export default function IncidentDetailPage() {
         </span>
       </div>
 
-      {/* Pipeline Flow */}
-      <div className="card mb-16">
-        <PipelineFlow status={incident.status} />
+      {/* Pipeline Flow: stages are completed only when the backend has recorded them */}
+      <div className="mb-16">
+        <PipelineFlow incident={incident} run={remediation?.run} />
       </div>
 
       {/* AI Incident Analysis (stored ai_report; display only) */}
+      {/* Kubernetes evidence collected by code when the incident context was built */}
+      <KubernetesEvidence evidence={incident.kubernetes} />
+
       {incident.ai_report && <AIReportCard report={incident.ai_report} />}
 
       {/* Stage 2: confidence-routed AI patch proposal (proposal only, never applied) */}
       {incident.ai_report && (
         <AIRemediationPanel incidentId={incident.id} report={incident.ai_report} refreshKey={eventCount} />
+      )}
+
+      {/* Stages 3-4: human approval -> GitHub PR -> controlled deployment -> recovery verification */}
+      {incident.ai_report && (
+        <RemediationPanel incidentId={incident.id} refreshKey={eventCount} onChange={setRemediation} />
       )}
 
       {/* Main Grid */}
@@ -504,7 +496,8 @@ export default function IncidentDetailPage() {
       )}
 
       {/* Escalation Approval */}
-      {incident.status === 'ESCALATED' && (
+      {/* Legacy escalation path; not offered after a Stage 3 rejection (the API refuses it too). */}
+      {incident.status === 'ESCALATED' && !remediation?.run && (
         <div className="card mt-16" style={{ borderColor: 'var(--warning)' }}>
           <h3 style={{ color: 'var(--warning)', marginBottom: 8 }}>⚠️ Human Approval Required</h3>
           <p className="text-sm text-muted mb-16">

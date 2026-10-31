@@ -1,58 +1,16 @@
 'use client';
 import { useState } from 'react';
+import { STAGES, pipelineStates } from '../lib/pipeline.mjs';
 
-const STAGES = [
-  { key: 'target', label: 'Target App', icon: '🎯', desc: 'The monitored workload. It exposes /metrics and /health; chaos faults are injected here.' },
-  { key: 'prometheus', label: 'Prometheus', icon: '📈', desc: 'Scrapes the target every 15s and evaluates alert rules (memory, CPU, restarts, up == 0).' },
-  { key: 'alertmanager', label: 'AlertManager', icon: '🔔', desc: 'Groups firing alerts and posts them as a webhook to the AutoFixOps API.' },
-  { key: 'api', label: 'AutoFixOps API', icon: '⚡', desc: 'Ingests the alert, de-duplicates it and creates an incident (INGESTED).' },
-  { key: 'context', label: 'Context', icon: '🧩', desc: 'Gathers metrics and resolves the target namespace / deployment / container.' },
-  { key: 'diagnosis', label: 'Diagnosis', icon: '🧠', desc: 'Rule engine first; unknown anomalies fall through to AI diagnosis with a confidence floor.' },
-  { key: 'policy', label: 'Policy', icon: '🛡', desc: 'Safety gates: kill switch, allowlist, confidence, protected namespaces, anti-thrash, circuit breaker.' },
-  { key: 'remediation', label: 'Remediation', icon: '🔧', desc: 'Applies bounded manifest patch and creates Pull Request for automated recovery.' },
-  { key: 'verification', label: 'Verification', icon: '✅', desc: 'Verifies actual workload health and telemetry stability before resolving incident.' },
-];
-
-// Index of the stage the incident is currently in (from existing incident status).
-const STATUS_STAGE = {
-  INGESTED: 3,
-  CONTEXT_BUILT: 4,
-  DIAGNOSED: 5,
-  POLICY_APPROVED: 6,
-  REMEDIATING: 7,
-  PENDING_PR_MERGE: 7,
-  VERIFIED: 8,
-  RESOLVED: 8,
+const STATE_TEXT = {
+  completed: 'completed (confirmed by the backend)', active: 'in progress', warning: 'needs a human',
+  failed: 'failed here', skipped: 'not used for this incident', idle: 'not reached',
 };
 
-function stageStates(status) {
-  const states = STAGES.map(() => 'idle');
-  if (!status) return states;
-
-  if (status === 'ESCALATED') {
-    for (let i = 0; i < 6; i++) states[i] = 'completed';
-    states[6] = 'warning';
-    return states;
-  }
-
-  if (status === 'FAILED') {
-    for (let i = 0; i < 8; i++) states[i] = 'completed';
-    states[8] = 'failed';
-    return states;
-  }
-
-  const current = STATUS_STAGE[status];
-  if (current != null) {
-    for (let i = 0; i < current; i++) states[i] = 'completed';
-    states[current] = status === 'RESOLVED' ? 'completed' : 'active';
-    return states;
-  }
-
-  return states;
-}
-
-export default function PipelineFlow({ incident }) {
-  const states = stageStates(incident?.status);
+// `run` (optional): the Stage 3-4 remediation run, so deployment/verification progress is shown
+// only once the backend has recorded it.
+export default function PipelineFlow({ incident, run = null }) {
+  const states = pipelineStates(incident, run);
   const activeIdx = states.indexOf('active');
   const [selected, setSelected] = useState(null);
   const shown = selected ?? (activeIdx >= 0 ? activeIdx : null);
@@ -89,7 +47,7 @@ export default function PipelineFlow({ incident }) {
 
       <div className="flow-desc">
         {shown != null
-          ? <><strong className="flow-highlight">{STAGES[shown].label}</strong> — {STAGES[shown].desc}</>
+          ? <><strong className="flow-highlight">{STAGES[shown].label}</strong> ({STATE_TEXT[states[shown]]}) — {STAGES[shown].desc}</>
           : 'Hover or select a stage to see what it does.'}
       </div>
     </div>

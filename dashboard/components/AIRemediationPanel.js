@@ -372,11 +372,12 @@ export default function AIRemediationPanel({ incidentId, report, refreshKey }) {
         <p className="text-sm text-muted" style={{ marginTop: 16 }}>No patch proposal has been stored for this incident yet.</p>
       )}
 
-      <div style={{ ...BOX, marginTop: 16, opacity: 0.7 }}>
-        <div className="text-sm" style={{ fontWeight: 600 }}>Stage 3 — Approve &amp; deploy (not available)</div>
+      <div style={{ ...BOX, marginTop: 16 }}>
+        <div className="text-sm" style={{ fontWeight: 600 }}>Next: Stages 3-4 (approval, pull request, deployment)</div>
         <p className="text-sm text-muted" style={{ marginTop: 4 }}>
-          Stage 2 stops at a validated proposal. It has not been applied to the manifest, committed, pushed,
-          opened as a pull request or deployed.
+          Stage 2 stops at a validated proposal: nothing here applies, commits, pushes or deploys it. A human can
+          approve or reject the exact validated diff in the panel below; deployment then needs the PR merged
+          (unless configured otherwise) and an explicitly enabled, allowlisted target.
         </p>
       </div>
     </div>

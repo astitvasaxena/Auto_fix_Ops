@@ -896,8 +896,8 @@ def test_no_apply_or_deploy_path():
     manifest = (REPO_ROOT / base.REL).read_bytes()
     mtime = os.stat(REPO_ROOT / base.REL).st_mtime_ns
     SF = base._factory()
-    incident_id = _incident(SF, 0.6)
-    run_real = lambda i, d, c: routing.run_generation(SF, i, d, c, REPO_ROOT, llm=base.StubLLM().runnable, env={},
+    incident_id = _incident(SF, 0.6, report=base.real_manifest_report(confidence=0.6))
+    run_real = lambda i, d, c: routing.run_generation(SF, i, d, c, REPO_ROOT, llm=base.MenuStubLLM().runnable, env={},
                                                       settings=FAST)
     client = _client(SF, Dispatcher(run_inline=run_real))
     assert client.post(f"/api/v1/incidents/{incident_id}/patch-proposals/approve").json()["started"]
