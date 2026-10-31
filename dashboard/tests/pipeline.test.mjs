@@ -75,3 +75,15 @@ test('blocked reasons are explained and stability progress is bounded', () => {
   assert.equal(stabilityProgress(run, Date.parse('2026-10-31T00:05:00Z')), 1);
   assert.equal(stabilityProgress({}), 0);
 });
+
+test('Kubernetes target badge and CI status come only from backend data', async () => {
+  const { podHealth, ciInfo } = await import('../lib/pipeline.mjs');
+  assert.equal(podHealth(null).label, 'UNKNOWN');
+  assert.equal(podHealth({ available: false }).label, 'UNKNOWN');
+  assert.equal(podHealth({ available: true, summary: { crash_loop: true, pods: 1, ready_pods: 0 } }).label, 'CRASHLOOPBACKOFF');
+  assert.equal(podHealth({ available: true, summary: { crash_loop: false, pods: 1, ready_pods: 1 } }).label, 'HEALTHY');
+  assert.equal(podHealth({ available: true, summary: { crash_loop: false, pods: 1, ready_pods: 0 } }).label, 'NOT READY');
+  assert.equal(ciInfo({}), null);
+  assert.equal(ciInfo({ ci_status: 'failure' }).icon, '❌');
+  assert.equal(ciInfo({ ci_status: 'success' }).label, 'success');
+});

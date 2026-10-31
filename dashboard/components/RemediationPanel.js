@@ -5,7 +5,7 @@
 // the buttons only send a decision (and the proposal id the human reviewed).
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
-import { RUN_STAGE_INFO, blockedText, lastRound, runSteps, stabilityProgress } from '../lib/pipeline.mjs';
+import { RUN_STAGE_INFO, blockedText, ciInfo, lastRound, runSteps, stabilityProgress } from '../lib/pipeline.mjs';
 
 const H3 = { fontSize: 14, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' };
 const LABEL = { fontSize: 12, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' };
@@ -59,6 +59,16 @@ function GitHubInfo({ github }) {
         <span className="mono">{github.merged ? 'merged' : github.pr_state}</span>
         {github.merged && <span className="text-muted"> · content {github.merged_content_matches ? 'matches' : 'DIFFERS'}</span>}</div>
       <div><div className="text-muted">Branch</div><span className="mono" style={{ wordBreak: 'break-all' }}>{github.branch}</span></div>
+      {ciInfo(github) && (
+        <div style={{ gridColumn: '1 / -1' }}>
+          <span className="text-muted">GitHub Actions on the PR commit: </span>
+          <span style={{ color: ciInfo(github).color }}>{ciInfo(github).icon} {ciInfo(github).label}</span>
+          {(github.ci_runs || []).map((r) => (
+            <a key={r.url} href={r.url} target="_blank" rel="noreferrer" className="text-sm" style={{ marginLeft: 8 }}>{r.name}</a>
+          ))}
+          {github.ci_required && <span className="text-muted"> · deployment waits for success</span>}
+        </div>
+      )}
     </div>
   );
 }

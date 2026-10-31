@@ -96,6 +96,9 @@ const BLOCKED_TEXT = {
   TARGET_BUSY: 'Another remediation is deploying to the same target; this one will retry automatically.',
   CLUSTER_UNREACHABLE: 'kubectl could not reach the cluster (check DEPLOY_KUBE_CONTEXT and that Kubernetes is running).',
   BRANCH_CONFLICT: 'The remediation branch already exists with different content.',
+  CI_PENDING: 'The PR is merged; deployment waits until GitHub Actions has passed on the PR commit.',
+  DEPLOY_STATE_UNKNOWN: 'The cluster could not be read after a deploy step; the change is checked again before anything else happens.',
+  PROPOSAL_CHANGED: 'The stored proposal no longer matches what was approved; nothing will be deployed.',
 };
 
 export function blockedText(code, detail) {
@@ -133,6 +136,24 @@ export function runSteps(run) {
     if (state === 'idle' && !activeSet && run.final) { state = 'failed'; activeSet = true; }
     return { ...s, state };
   });
+}
+
+/** Badge for the Kubernetes target from GET /target/kubernetes evidence. */
+export function podHealth(evidence) {
+  if (!evidence?.available) return { label: 'UNKNOWN', color: 'var(--text-muted)' };
+  const s = evidence.summary || {};
+  if (s.crash_loop) return { label: 'CRASHLOOPBACKOFF', color: 'var(--error)' };
+  if (s.pods > 0 && s.ready_pods === s.pods) return { label: 'HEALTHY', color: 'var(--success)' };
+  return { label: 'NOT READY', color: 'var(--warning)' };
+}
+
+/** "success" | "failure" | "pending" | "not required" -> display. */
+export function ciInfo(github) {
+  const status = github?.ci_status;
+  if (!status) return null;
+  const map = { success: ['✅', 'var(--success)'], failure: ['❌', 'var(--error)'], pending: ['⏳', 'var(--info)'] };
+  const [icon, color] = map[status] || ['·', 'var(--text-muted)'];
+  return { icon, color, label: status };
 }
 
 export function lastRound(run) {

@@ -276,6 +276,10 @@ def get_incident_context(incident_id: uuid.UUID, db: Session = Depends(get_db)):
             "resolved_at": incident.resolved_at.isoformat() if incident.resolved_at else None,
             "source": _incident_source(incident),
             "status_timeline": incident.status_timeline or [],
+            # Code-collected Kubernetes evidence captured when the context was built.
+            "kubernetes": ((incident.raw_payload_cache or {}).get("raw_context") or {}).get("kubernetes"),
+            "telemetry_source": (((incident.raw_payload_cache or {}).get("raw_context") or {})
+                                 .get("telemetry") or {}).get("source"),
         },
         "telemetry_context": mongo_ctx,
         "remediation_audits": [

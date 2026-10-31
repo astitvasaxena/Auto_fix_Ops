@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '../../lib/api';
 import PipelineFlow from '../../components/PipelineFlow';
+import KubernetesTargetCard from '../../components/KubernetesTargetCard';
 
 const STATUSES = ['ALL', 'INGESTED', 'CONTEXT_BUILT', 'DIAGNOSED', 'POLICY_APPROVED', 'REMEDIATING', 'PENDING_PR_MERGE', 'VERIFIED', 'ESCALATED', 'RESOLVED', 'FAILED'];
 
@@ -54,6 +55,7 @@ export default function IncidentsPage() {
         <span className="mono text-muted text-sm">{incidents.length} total</span>
       </div>
 
+      <KubernetesTargetCard showChaos={false} />
       <PipelineFlow incident={incidents[0]} />
 
       <div className="filter-bar">

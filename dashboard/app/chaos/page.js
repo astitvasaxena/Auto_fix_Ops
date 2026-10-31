@@ -1,6 +1,7 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../../lib/api';
+import KubernetesTargetCard from '../../components/KubernetesTargetCard';
 
 const FAULTS = [
   {
@@ -173,6 +174,9 @@ export default function ChaosPage() {
           Only allowed in configured namespaces. Rate limited: 1 injection per 60 seconds per fault type.
         </div>
       </div>
+
+      {/* Kubernetes target: live pod health and the reproducible crash-loop fault */}
+      <KubernetesTargetCard showChaos />
 
       {/* Target URL */}
       <div className="card mb-16">

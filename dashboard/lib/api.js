@@ -67,6 +67,12 @@ export const api = {
     method: 'POST', headers: authHeader(token), body: JSON.stringify({ reason })
   }),
 
+  // Kubernetes target health (read-only) and crash-loop chaos (opt-in, never creates an incident)
+  getKubernetesTarget: () => fetchAPI('/api/v1/target/kubernetes'),
+  injectKubernetesChaos: (fault, confirmation, token) => fetchAPI('/api/v1/chaos/kubernetes', {
+    method: 'POST', headers: authHeader(token), body: JSON.stringify({ fault, confirmation })
+  }),
+
   // Metrics
   getMetrics: () => fetchAPI('/api/v1/metrics'),
 

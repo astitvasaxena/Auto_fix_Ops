@@ -7,6 +7,38 @@ import AIRemediationPanel from '../../../components/AIRemediationPanel';
 import RemediationPanel from '../../../components/RemediationPanel';
 import PipelineFlow from '../../../components/PipelineFlow';
 
+function KubernetesEvidence({ evidence }) {
+  if (!evidence) return null;
+  const label = { fontSize: 12, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' };
+  if (!evidence.available) {
+    return <div className="card mb-16 text-sm text-muted">Kubernetes evidence: not collected ({evidence.reason})</div>;
+  }
+  const s = evidence.summary || {};
+  return (
+    <div className="card mb-16">
+      <div style={label}>Kubernetes evidence · collected by code at {new Date(evidence.collected_at).toLocaleTimeString()}</div>
+      <div className="text-sm" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+        <div><div className="text-muted">Pod state</div><span className="mono" style={{ color: s.crash_loop ? 'var(--error)' : undefined }}>
+          {s.waiting_reason || (s.ready_pods === s.pods ? 'Ready' : 'Not ready')}</span></div>
+        <div><div className="text-muted">Restarts</div><span className="mono">{s.restart_count}</span></div>
+        <div><div className="text-muted">Last termination</div><span className="mono">{s.last_termination_reason || '—'}
+          {s.last_exit_code != null && ` (exit ${s.last_exit_code})`}</span></div>
+        <div><div className="text-muted">Live limits</div><span className="mono">{s.live_memory_limit} / {s.live_cpu_limit}</span></div>
+      </div>
+      {evidence.events?.length > 0 && (
+        <ul style={{ margin: '10px 0 0', paddingLeft: 18, fontSize: 13, color: 'var(--text-secondary)' }}>
+          {evidence.events.map((e, i) => <li key={i}><span className="mono">{e.reason}</span> ×{e.count ?? 1} — {e.message}</li>)}
+        </ul>
+      )}
+      {evidence.logs_previous_container?.length > 0 && (
+        <pre className="mono" style={{ marginTop: 10, fontSize: 12, background: 'var(--bg-secondary)', padding: 8, borderRadius: 6, whiteSpace: 'pre-wrap' }}>
+          {evidence.logs_previous_container.join('\n')}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 const PROVIDER_LABELS = { ollama: 'Ollama', openai: 'OpenAI' };
 // Older stored reports cite the retired synthetic runbooks; label them as such.
 const SOURCE_TYPE_LABELS = { official_documentation: 'Official documentation', synthetic_runbook: 'Synthetic runbook (retired)' };
@@ -235,6 +267,9 @@ export default function IncidentDetailPage() {
       </div>
 
       {/* AI Incident Analysis (stored ai_report; display only) */}
+      {/* Kubernetes evidence collected by code when the incident context was built */}
+      <KubernetesEvidence evidence={incident.kubernetes} />
+
       {incident.ai_report && <AIReportCard report={incident.ai_report} />}
 
       {/* Stage 2: confidence-routed AI patch proposal (proposal only, never applied) */}
