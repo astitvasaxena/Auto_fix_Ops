@@ -304,8 +304,11 @@ def test_full_flow_pr_deploy_verify_resolved():
     assert all(c["ok"] for c in view["verification"]["rounds"][-1]["checks"])
     inc = w.incident()
     assert inc.status == IncidentStatus.RESOLVED and inc.resolved_at is not None
-    assert [e["status"] for e in inc.status_timeline][-5:] == [
-        "POLICY_APPROVED", "REMEDIATING", "PENDING_PR_MERGE", "VERIFIED", "RESOLVED"]
+    statuses = [e["status"] for e in inc.status_timeline if e.get("event") != "NOTE"]
+    assert statuses[-5:] == ["POLICY_APPROVED", "REMEDIATING", "PENDING_PR_MERGE", "VERIFIED", "RESOLVED"]
+    notes = [e["note"] for e in inc.status_timeline if e.get("event") == "NOTE"]
+    assert any("pull request #1 opened" in x for x in notes) and any("merged" in x for x in notes)
+    assert any("deployed memory limit" in x for x in notes) and any("recovery verified" in x for x in notes)
     assert w.runs()[0].deploy_lock is None
     db = w.SF()
     timeline = wf.incident_timeline(db, db.query(Incident).first())
@@ -376,11 +379,11 @@ def test_verification_failure_rolls_back_and_opens_revert_pr():
     assert w.kube.memory == "100Mi"                  # previous value restored
     assert view["rollback"]["ok"] and view["rollback"]["git_revert"]["created"]
     assert w.github.branches["autofixops/revert-" + str(w.proposal_id)[:8]][base.REL] == base.MANIFEST_LF.encode()
-    assert w.incident().status == IncidentStatus.FAILED
+    assert w.incident().status == IncidentStatus.ESCALATED
     assert w.runs()[0].deploy_lock is None
     failing = [c["name"] for c in view["verification"]["rounds"][-1]["checks"] if not c["ok"]]
     assert "alert_cleared" in failing
-    print("✅ PASS: verification never stable → inverse patch restores 100Mi, revert PR, incident FAILED")
+    print("✅ PASS: verification never stable → inverse patch restores 100Mi, revert PR, incident ESCALATED")
 
 
 def test_rollout_failure_rolls_back():
@@ -393,7 +396,7 @@ def test_rollout_failure_rolls_back():
     assert view["stage"] == wf.ROLLBACK_FAILED or view["stage"] == wf.ROLLED_BACK
     # the fake's rollout keeps failing, so the rollback rollout also fails: reported, never hidden
     assert view["stage"] == wf.ROLLBACK_FAILED and w.kube.memory == "100Mi"
-    assert w.incident().status == IncidentStatus.FAILED
+    assert w.incident().status == IncidentStatus.ESCALATED
     print("✅ PASS: rollout failure → value restored; a failing rollback rollout is reported as ROLLBACK_FAILED")
 
 
@@ -470,7 +473,7 @@ def test_ci_must_pass_on_the_pr_before_deployment():
     assert view["github"]["ci_status"] == "pending"
     w.github.ci = [{"name": "CI", "status": "completed", "conclusion": "failure", "url": "u"}]
     view = w.advance(run["id"])
-    assert view["stage"] == wf.FAILED and w.kube.argvs == [] and w.incident().status == IncidentStatus.FAILED
+    assert view["stage"] == wf.FAILED and w.kube.argvs == [] and w.incident().status == IncidentStatus.ESCALATED
     assert any(e["event"] == "CI_FAILED" for e in view["audit_log"])
 
     w2 = World()
@@ -503,7 +506,7 @@ def test_pr_closed_or_base_changed_fails_safely():
     w.advance(run["id"])
     w.github.prs[0].update(state="closed")
     assert w.advance(run["id"])["stage"] == wf.FAILED
-    assert w.incident().status == IncidentStatus.FAILED
+    assert w.incident().status == IncidentStatus.ESCALATED
 
     w2 = World()
     w2.github.branches["main"][base.REL] = w2.github.commits["c0"][base.REL] = b"kind: Changed\n"
@@ -745,7 +748,7 @@ def test_crash_during_rollout_is_reconciled_and_rolled_back():
     view = w.advance(_ready_to_deploy(w))
     assert view["stage"] == wf.ROLLED_BACK, (view["stage"], view["blocked_code"])
     assert w.kube.memory == "100Mi" and w.runs()[0].deploy_lock is None
-    assert w.incident().status == IncidentStatus.FAILED
+    assert w.incident().status == IncidentStatus.ESCALATED
     print("✅ PASS: a crash after the patch is reconciled from the live state and rolled back; lock released")
 
 
@@ -818,13 +821,121 @@ def test_incident_state_conflict_does_not_leave_the_run_claimed():
     w = World()
     run, _ = w.approve()
     db = w.SF()
-    db.query(Incident).update({"status": IncidentStatus.FAILED})    # e.g. a stray legacy task
+    db.query(Incident).update({"status": IncidentStatus.FAILED})    # e.g. a stray legacy task (kept FAILED)
     db.commit()
     db.close()
     view = w.advance(run["id"])
     assert view["stage"] == wf.PR_OPEN and not view["step_in_progress"]
     assert any(e["event"] == "INCIDENT_STATE_CONFLICT" for e in view["audit_log"])
     print("✅ PASS: an incident moved elsewhere is recorded; the run outcome is kept and the claim cleared")
+
+
+# ─── Verification failures, GitHub errors, audit timeline (final audit follow-ups) ───
+
+def _verify_until_final(w, run_id, rounds=14):
+    view = None
+    for _ in range(rounds):
+        w.clock.tick(10)
+        view = w.advance(run_id)
+        if view["final"]:
+            break
+    return view
+
+
+def test_health_endpoint_failing_alone_rolls_back_and_escalates():
+    w = World(health=503)                                   # everything else is healthy
+    run_id = w.to_verifying()
+    view = _verify_until_final(w, run_id)
+    assert view["stage"] == wf.ROLLED_BACK and w.kube.memory == "100Mi", view["stage"]
+    failing = {c["name"] for c in view["verification"]["rounds"][-1]["checks"] if not c["ok"]}
+    assert failing == {"app_health"}, failing
+    assert w.incident().status == IncidentStatus.ESCALATED
+    assert view["verification"]["result"] == "FAILED" and view["rollback"]["ok"]
+    print("✅ PASS: health endpoint failing alone → never stable → rollback, incident ESCALATED")
+
+
+def test_pods_never_ready_after_rollout_rolls_back():
+    w = World()
+    run_id = w.to_verifying()
+    w.kube.healthy = False                                  # the new pod is not ready / CrashLoopBackOff
+    view = _verify_until_final(w, run_id)
+    assert view["stage"] == wf.ROLLED_BACK, view["stage"]
+    checks = {c["name"]: c for c in view["verification"]["rounds"][-1]["checks"]}
+    assert not checks["pods_healthy"]["ok"] and "CrashLoopBackOff" in checks["pods_healthy"]["detail"]
+    assert w.incident().status == IncidentStatus.ESCALATED
+    print("✅ PASS: pod not ready after the rollout → rollback, incident ESCALATED")
+
+
+def test_github_api_error_while_opening_the_pr_blocks_and_retries():
+    from engine.github_gateway import GitHubError
+
+    w = World()
+    real_create = w.github.create_pr
+    failures = []
+
+    def flaky_create(*a, **kw):
+        if not failures:
+            failures.append(1)
+            raise GitHubError("GITHUB_API_ERROR", "create pull request: HTTP 502 Bad Gateway")
+        return real_create(*a, **kw)
+
+    w.github.create_pr = flaky_create
+    run, _ = w.approve()
+    view = w.advance(run["id"])
+    assert view["stage"] == wf.APPROVED and view["blocked_code"] == "GITHUB_API_ERROR" and w.github.prs == []
+    assert w.incident().status == IncidentStatus.POLICY_APPROVED
+    view = w.advance(run["id"])                              # retry: the branch already holds the patch
+    assert view["stage"] == wf.PR_OPEN and len(w.github.prs) == 1, view
+    assert [c[0] for c in w.github.calls].count("put_file") == 1
+    print("✅ PASS: a GitHub API error while opening the PR changes nothing and the retry opens one PR")
+
+
+def test_events_use_observed_times_and_notes_are_appended():
+    w = World()
+    run, _ = w.approve()
+    real_get_pr = w.github.get_pr
+
+    def slow_get_pr(number):
+        w.clock.tick(7)                                     # the merge is seen 7 s after the step started
+        return real_get_pr(number)
+
+    w.github.get_pr = slow_get_pr
+    w.advance(run["id"])
+    w.github.merge(1)
+    started = w.clock()
+    view = w.advance(run["id"])
+    merged = next(e for e in view["audit_log"] if e["event"] == "PR_MERGED")
+    assert merged["at"] == wf._iso(started + datetime.timedelta(seconds=7)), (merged["at"], started)
+    assert view["github"]["merged_seen_at"] == merged["at"]
+    notes = [e for e in w.incident().status_timeline if e.get("event") == "NOTE"]
+    assert len(notes) >= 3 and all(n.get("note") for n in notes)          # approved, PR opened, merged
+    assert len({n["note"] for n in notes}) == len(notes)                  # none overwritten
+    print("✅ PASS: PR_MERGED is stamped when observed; timeline notes are appended, never overwritten")
+
+
+def test_escalated_incident_can_be_closed_by_a_human():
+    w = World(kube=FakeKube(rollout_ok=False))
+    run, _ = w.approve()
+    w.advance(run["id"])
+    w.github.merge(1)
+    w.advance(run["id"])
+    view = w.advance(run["id"])
+    assert view["final"] and w.incident().status == IncidentStatus.ESCALATED
+    wf.close_incident(w.SF, w.incident_id, ACTOR, "fixed the image by hand")
+    assert w.incident().status == IncidentStatus.RESOLVED
+    print("✅ PASS: a failed remediation escalates; a human can close it with a reason")
+
+
+def test_celery_redelivers_tasks_lost_with_a_worker():
+    from workers.celery_app import celery_app
+
+    conf = celery_app.conf
+    assert conf.task_acks_late is True and conf.task_reject_on_worker_lost is True
+    assert conf.worker_prefetch_multiplier == 1
+    timeout = conf.broker_transport_options["visibility_timeout"]
+    assert timeout > 900 and timeout > 600 + 60                      # > longest countdown and longest task
+    assert wf._pr_poll_s(wf.Deps(github=None, env={"REMEDIATION_PR_POLL_SECONDS": "99999"})) == 900
+    print("✅ PASS: tasks are acknowledged after completion; countdowns stay below the visibility timeout")
 
 
 def test_proposal_changed_after_approval_blocks_every_step():

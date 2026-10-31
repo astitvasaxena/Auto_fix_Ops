@@ -25,4 +25,12 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_retries=3,
+    # Acknowledge a task only after it finished, so a task running when the worker is killed is
+    # delivered again (every pipeline task re-checks the incident/run state and claims its step,
+    # so a second delivery is harmless). Redis restores unacknowledged tasks after the visibility
+    # timeout, which must exceed the longest task and the longest countdown (PR polling <= 900 s).
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
+    broker_transport_options={"visibility_timeout": 1800},
 )

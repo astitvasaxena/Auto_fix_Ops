@@ -120,10 +120,10 @@ def _move(incident, *statuses):
 
 
 def _note_timeline(incident, note: str):
-    timeline = list(incident.status_timeline or [])
-    if timeline:
-        timeline[-1] = {**timeline[-1], "note": note[:300]}
-        incident.status_timeline = timeline
+    """Appends a note entry (never overwrites an earlier one) stamped with the current time."""
+    incident.status_timeline = list(incident.status_timeline or []) + [{
+        "status": incident.status.value, "event": "NOTE", "note": note[:300],
+        "timestamp": datetime.datetime.utcnow().isoformat()}]
 
 
 # ─── Dependencies (replaced by fakes in tests) ───
@@ -511,7 +511,8 @@ def _publish_pr(session_factory, run, proposal, snap, deps, token, now) -> Outco
         else:
             commit_sha = pr.get("head_sha")
     except WorkflowError as exc:
-        return Outcome(stage=FAILED, incident=("REMEDIATING", "FAILED"), note=f"PR not created: {exc.code}",
+        return Outcome(stage=FAILED, incident=("REMEDIATING", "ESCALATED"),
+                       note=f"PR not created: {exc.code}; escalated to a human",
                        events=[_event("PR_FAILED", now, code=exc.code, detail=exc.detail)],
                        updates={"blocked_code": exc.code})
     except Exception as exc:   # GitHubError and network errors: nothing merged, retry later
@@ -519,15 +520,16 @@ def _publish_pr(session_factory, run, proposal, snap, deps, token, now) -> Outco
     github = {"mode": "github", "repo": info.get("repo"), "branch": branch, "base_branch": base_branch,
               "base_commit_sha": base_commit, "commit_sha": commit_sha, "pr_number": pr["number"],
               "pr_url": pr["url"], "pr_state": pr["state"], "merged": pr["merged"], "draft": pr.get("draft"),
-              "patched_blob_sha": proposal.patched_git_blob_sha, "opened_at": _iso(now), "last_checked_at": _iso(now)}
+              "patched_blob_sha": proposal.patched_git_blob_sha, "opened_at": _iso(deps.now()),
+              "last_checked_at": _iso(deps.now())}
     return Outcome(stage=PR_OPEN, updates={"github": github}, incident=("REMEDIATING", "PENDING_PR_MERGE"),
-                   events=[_event("PR_OPENED", now, number=pr["number"], url=pr["url"], draft=pr.get("draft"))],
+                   events=[_event("PR_OPENED", deps.now(), number=pr["number"], url=pr["url"], draft=pr.get("draft"))],
                    note=f"pull request #{pr['number']} opened", next_in=_pr_poll_s(deps))
 
 
 def _pr_poll_s(deps) -> int:
     try:
-        return max(10, min(3600, int(deps.env.get("REMEDIATION_PR_POLL_SECONDS", 30))))
+        return max(10, min(900, int(deps.env.get("REMEDIATION_PR_POLL_SECONDS", 30))))   # < Celery visibility timeout
     except (TypeError, ValueError):
         return 30
 
@@ -562,7 +564,7 @@ def _check_pr(session_factory, run, proposal, snap, deps, token, now) -> Outcome
                       ci_head_sha=pr["head_sha"])
         if pr["merged"] and require_ci and github["ci_status"] != "success":
             if github["ci_status"] == "failure":
-                return Outcome(stage=FAILED, updates={"github": github}, incident=("FAILED",),
+                return Outcome(stage=FAILED, updates={"github": github}, incident=("ESCALATED",),
                                events=[_event("CI_FAILED", now, head_sha=pr["head_sha"])],
                                note="the PR was merged but GitHub Actions failed on it; not deployed")
             return Outcome(updates={"github": github}, next_in=_pr_poll_s(deps),
@@ -571,15 +573,16 @@ def _check_pr(session_factory, run, proposal, snap, deps, token, now) -> Outcome
             content, _ = gateway.get_file(proposal.target_file, pr["merge_commit_sha"])
             if git_blob_sha(content.replace(b"\r\n", b"\n")) != proposal.patched_git_blob_sha:
                 github["merged_content_matches"] = False
-                return Outcome(stage=FAILED, updates={"github": github}, incident=("FAILED",),
+                return Outcome(stage=FAILED, updates={"github": github}, incident=("ESCALATED",),
                                events=[_event("MERGED_CONTENT_MISMATCH", now, merge_commit=pr["merge_commit_sha"])],
                                note="merged manifest differs from the approved patch; not deployed")
-            github.update(merged_content_matches=True, merge_commit_sha=pr["merge_commit_sha"], merged_seen_at=_iso(now))
+            seen = deps.now()   # when the merge was actually observed, not when the step started
+            github.update(merged_content_matches=True, merge_commit_sha=pr["merge_commit_sha"], merged_seen_at=_iso(seen))
             return Outcome(stage=READY_TO_DEPLOY, updates={"github": github}, next_in=0,
-                           events=[_event("PR_MERGED", now, merge_commit=pr["merge_commit_sha"])],
+                           events=[_event("PR_MERGED", seen, merge_commit=pr["merge_commit_sha"])],
                            note=f"pull request #{github['pr_number']} merged")
         if pr["state"] == "closed":
-            return Outcome(stage=FAILED, updates={"github": github}, incident=("FAILED",),
+            return Outcome(stage=FAILED, updates={"github": github}, incident=("ESCALATED",),
                            events=[_event("PR_CLOSED_UNMERGED", now)], note="pull request closed without merge")
     except Exception as exc:
         return Outcome(updates={"github": github}, next_in=_pr_poll_s(deps),
@@ -619,7 +622,7 @@ def _deploy(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
         deployment.update(error=exc.code, detail=exc.detail, commands=kube.commands)
         final = exc.code in ("DRIFT_DETECTED", "DRY_RUN_REFUSED", "PATCH_REFUSED", "TARGET_NOT_FOUND")
         if final:
-            return Outcome(stage=FAILED, updates={"deployment": deployment}, incident=("FAILED",),
+            return Outcome(stage=FAILED, updates={"deployment": deployment}, incident=("ESCALATED",),
                            events=[_event("DEPLOY_REFUSED", deps.now(), code=exc.code, detail=exc.detail)],
                            note=f"deployment refused before any change: {exc.code}")
         return Outcome(stage=READY_TO_DEPLOY, updates={"deployment": deployment}, blocked=(exc.code, exc.detail))
@@ -659,7 +662,7 @@ def _reconcile(session_factory, run, proposal, snap, deps, kube, target, deploym
         _set_lock(session_factory, run.id, None)
         return Outcome(stage=READY_TO_DEPLOY, updates={"deployment": deployment},
                        blocked=("DEPLOY_INTERRUPTED", f"{why}; the live value is unchanged, safe to retry"))
-    return Outcome(stage=FAILED, updates={"deployment": deployment}, incident=("FAILED",),
+    return Outcome(stage=FAILED, updates={"deployment": deployment}, incident=("ESCALATED",),
                    events=[_event("DRIFT_DETECTED", deps.now(), live=str(value))],
                    note=f"{why}; live {target.resource} limit is {value}, changed by someone else - manual review needed")
 
@@ -734,7 +737,7 @@ def _rollback(session_factory, run, proposal, snap, deps, kube, target, index, d
     stage = ROLLED_BACK if result["ok"] else ROLLBACK_FAILED
     note = (f"remediation failed ({why}); rolled back to {target.old_value}" if result["ok"]
             else f"remediation failed ({why}); ROLLBACK FAILED - manual action required")
-    return Outcome(stage=stage, updates=updates, incident=("FAILED",), note=note,
+    return Outcome(stage=stage, updates=updates, incident=("ESCALATED",), note=note,
                    events=[_event("ROLLED_BACK" if result["ok"] else "ROLLBACK_FAILED", now, reason=why[:300])])
 
 
@@ -889,8 +892,12 @@ def incident_timeline(db, incident) -> list:
               "label": f"Alert {incident.alert_name} received", "source": "alertmanager/api"}]
     for entry in incident.status_timeline or []:
         ts = entry.get("timestamp")
-        items.append({"at": (ts + "Z") if ts and not ts.endswith("Z") else ts, "kind": f"STATUS_{entry.get('status')}",
-                      "label": f"Incident {entry.get('status')}", "note": entry.get("note"), "source": "incident"})
+        at = (ts + "Z") if ts and not ts.endswith("Z") else ts
+        if entry.get("event") == "NOTE":
+            items.append({"at": at, "kind": "NOTE", "label": entry.get("note"), "source": "incident"})
+        else:
+            items.append({"at": at, "kind": f"STATUS_{entry.get('status')}", "label": f"Incident {entry.get('status')}",
+                          "note": entry.get("note"), "source": "incident"})
     for d in db.query(PatchRoutingDecision).filter(PatchRoutingDecision.incident_id == incident.id).all():
         for e in d.audit_log or []:
             items.append({"at": e.get("at"), "kind": f"ROUTING_{e.get('event')}", "label": f"Stage 2: {e.get('event')}",
