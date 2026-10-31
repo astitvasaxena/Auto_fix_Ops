@@ -146,13 +146,17 @@ async def receive_alert(
 
         # Prevent duplicate processing of the same active incident. Alerts in one group describe
         # the same outage (a crash-looping target is both "down" and "restarting"): one incident.
+        # Only a recent incident counts: one left open for days (e.g. stuck in a legacy state)
+        # must not swallow a new outage.
         same_outage = next((g for g in _ALERT_GROUPS if alert_name in g), (alert_name,))
+        recent = datetime.utcnow() - timedelta(hours=float(os.getenv("DEDUP_ACTIVE_HOURS", "6")))
         active_incident = (
             db.query(Incident)
             .filter(
                 Incident.alert_name.in_(same_outage),
                 Incident.status.notin_(_CLOSED_STATUSES),
                 Incident.project_id == default_project_id,
+                Incident.created_at >= recent,
             )
             .order_by(Incident.created_at.desc())
             .first()

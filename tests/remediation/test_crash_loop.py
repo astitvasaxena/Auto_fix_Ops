@@ -258,8 +258,24 @@ def test_down_and_crash_loop_alerts_share_one_incident():
         api_main.app.dependency_overrides.pop(get_db, None)
     db = SF()
     names = sorted(i.alert_name for i in db.query(Incident).all())
+    # An incident left open for days does not swallow a new outage.
+    import datetime as _dt
+    db.query(Incident).update({"created_at": _dt.datetime.utcnow() - _dt.timedelta(days=20)})
+    db.commit()
     db.close()
     assert names == ["TargetAppDown"], names
+    api_main.app.dependency_overrides[get_db] = _get_db
+    try:
+        with patch.object(api_main, "is_system_disabled", lambda: False), \
+             patch.object(api_main, "get_default_project_id", lambda: None), \
+             patch.object(api_main, "emit_sync", lambda *a, **k: None), \
+             patch.object(api_main.build_incident_context, "apply_async", MagicMock()):
+            assert TestClient(api_main.app).post("/api/v1/alerts", json=alert("HighMemoryUsage")).status_code == 200
+    finally:
+        api_main.app.dependency_overrides.pop(get_db, None)
+    db = SF()
+    assert db.query(Incident).count() == 2
+    db.close()
     print("✅ PASS: down / crash-loop / memory alerts for one target outage create one incident")
 
 
