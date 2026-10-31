@@ -27,6 +27,8 @@ DEFAULT_WORKLOAD = "autofixops-target-app"
 DEFAULT_SCRAPE_JOB = "autofixops-target"
 WINDOW = "5m"
 GROWTH_WINDOW = "3m"   # memory slope at incident time: a leak is still growing, a one-off step is not
+# Memory still growing at least this fast is treated as a leak (patch proposer, recovery verification).
+LEAK_GROWTH_MIB_PER_MIN = 5.0
 
 # Label values end up inside PromQL strings, so only plain Kubernetes-style
 # names are accepted (no quotes, braces or regex characters).

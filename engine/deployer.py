@@ -1,8 +1,9 @@
 """
 Controlled deployment for Stage 4.
 ==================================
-Applies ONE approved, validated resource-limit change to ONE allowlisted
-Kubernetes Deployment, and can undo it exactly.
+Applies ONE approved, validated change - a resource limit, or turning off an
+allowlisted feature flag (container env value "true" -> "false") - to ONE
+allowlisted Kubernetes Deployment, and can undo it exactly.
 
 How it stays controlled:
   - Off unless configured: DEPLOY_MODE=kubectl plus an explicit DEPLOY_KUBE_CONTEXT
@@ -27,6 +28,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
+from engine.patch_safety import FEATURE_FLAGS
 from engine.policy import RESTRICTED_NAMESPACES
 
 _K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
@@ -35,6 +37,7 @@ _QUANTITY = re.compile(r"^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|K|M|G)?$")
 _SERVICE_PROXY = re.compile(r"^/api/v1/namespaces/[a-z0-9-]{1,63}/services/[a-z0-9-]{1,63}:[0-9]{1,5}/proxy/[A-Za-z0-9._/-]{0,200}$")
 _POD_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 _FIELD_PATH = re.compile(r"^spec\.template\.spec\.containers\[\d+\]\.resources\.limits\.(memory|cpu)$")
+_FLAG_PATH = re.compile(r"^spec\.template\.spec\.containers\[\d+\]\.env\[name=([A-Z][A-Z0-9_]{0,62})\]\.value$")
 MAX_OUTPUT = 2000
 
 
@@ -113,28 +116,40 @@ class Target:
     namespace: str
     name: str
     container: str
-    resource: str          # "memory" | "cpu"
+    resource: str          # "memory" | "cpu" | "env" (a feature flag)
     old_value: str
     new_value: str
+    env_name: str = ""     # the feature flag, when resource == "env"
 
     @property
     def key(self) -> str:
         return f"{self.namespace}/{self.name}"
+
+    @property
+    def field(self) -> str:
+        """What the change sets, for notes and events."""
+        return f"{self.env_name} flag" if self.resource == "env" else f"{self.resource} limit"
 
 
 def target_from_proposal(target_ref: dict, proposed_values: dict) -> Target:
     """Builds the deployment target from a stored VALIDATED proposal, re-checking every value."""
     ref, values = target_ref or {}, proposed_values or {}
     field_path = values.get("field_path") or ref.get("field_path") or ""
-    match = _FIELD_PATH.match(field_path)
-    if ref.get("kind") != "Deployment" or not match or values.get("op") != "replace_scalar":
-        raise DeployBlocked("TARGET_INVALID", "proposal does not describe a Deployment resource-limit change")
+    match, flag = _FIELD_PATH.match(field_path), _FLAG_PATH.match(field_path)
+    if ref.get("kind") != "Deployment" or not (match or flag) or values.get("op") != "replace_scalar":
+        raise DeployBlocked("TARGET_INVALID", "proposal does not describe a Deployment resource-limit or feature-flag change")
     target = Target(namespace=str(ref.get("namespace") or ""), name=str(ref.get("name") or ""),
-                    container=str(ref.get("container") or ""), resource=match.group(1),
-                    old_value=str(values.get("old_value") or ""), new_value=str(values.get("new_value") or ""))
+                    container=str(ref.get("container") or ""), resource=match.group(1) if match else "env",
+                    old_value=str(values.get("old_value") or ""), new_value=str(values.get("new_value") or ""),
+                    env_name=flag.group(1) if flag else "")
     for label, value in (("namespace", target.namespace), ("name", target.name), ("container", target.container)):
         if not _K8S_NAME.match(value):
             raise DeployBlocked("TARGET_INVALID", f"{label} {value!r} is not a plain Kubernetes name")
+    if flag:
+        # A feature flag may only be turned off.
+        if target.env_name not in FEATURE_FLAGS or (target.old_value, target.new_value) != ("true", "false"):
+            raise DeployBlocked("TARGET_INVALID", f"only an allowlisted feature flag may change, from true to false")
+        return target
     for label, value in (("old value", target.old_value), ("new value", target.new_value)):
         if not _QUANTITY.match(value):
             raise DeployBlocked("TARGET_INVALID", f"{label} {value!r} is not a plain quantity")
@@ -254,8 +269,36 @@ def live_limit(live: dict, index: int, resource: str) -> Optional[str]:
     return ((c.get("resources") or {}).get("limits") or {}).get(resource)
 
 
-def patch_ops(t: Target, index: int, expect: str, put: str) -> list:
+def env_index(live: dict, index: int, name: str) -> Optional[int]:
+    """Position of the container's env entry `name` (None if it is not set)."""
+    env = live["spec"]["template"]["spec"]["containers"][index].get("env") or []
+    found = [i for i, e in enumerate(env) if isinstance(e, dict) and e.get("name") == name]
+    return found[0] if len(found) == 1 else None
+
+
+def live_flags(live: dict, index: int) -> Dict[str, Optional[str]]:
+    """Literal values of the allowlisted feature flags in the live container (absent -> not listed)."""
+    env = live["spec"]["template"]["spec"]["containers"][index].get("env") or []
+    return {e["name"]: e.get("value") for e in env
+            if isinstance(e, dict) and e.get("name") in FEATURE_FLAGS and "valueFrom" not in e}
+
+
+def live_value(live: dict, index: int, t: Target) -> Optional[str]:
+    """The live value of what the target changes: a resource limit or a feature flag."""
+    if t.resource == "env":
+        j = env_index(live, index, t.env_name)
+        return None if j is None else live["spec"]["template"]["spec"]["containers"][index]["env"][j].get("value")
+    return live_limit(live, index, t.resource)
+
+
+def patch_ops(t: Target, index: int, expect: str, put: str, env_at: Optional[int] = None) -> list:
     base = f"/spec/template/spec/containers/{index}"
+    if t.resource == "env":
+        path = f"{base}/env/{env_at}"
+        return [{"op": "test", "path": f"{base}/name", "value": t.container},
+                {"op": "test", "path": f"{path}/name", "value": t.env_name},
+                {"op": "test", "path": f"{path}/value", "value": expect},
+                {"op": "replace", "path": f"{path}/value", "value": put}]
     return [{"op": "test", "path": f"{base}/name", "value": t.container},
             {"op": "test", "path": f"{base}/resources/limits/{t.resource}", "value": expect},
             {"op": "replace", "path": f"{base}/resources/limits/{t.resource}", "value": put}]
@@ -267,7 +310,7 @@ def snapshot(live: dict, index: int) -> dict:
     return {"generation": meta.get("generation"), "resource_version": meta.get("resourceVersion"),
             "replicas": spec.get("replicas"), "selector": (spec.get("selector") or {}).get("matchLabels"),
             "container": {"index": index, "name": c.get("name"), "image": c.get("image"),
-                          "resources": c.get("resources")}}
+                          "resources": c.get("resources"), "feature_flags": live_flags(live, index)}}
 
 
 def apply_change(kube: Kubectl, t: Target) -> dict:
@@ -278,10 +321,11 @@ def apply_change(kube: Kubectl, t: Target) -> dict:
     """
     live = kube.get_deployment(t)
     index = container_index(live, t.container)
-    current = live_limit(live, index, t.resource)
+    current = live_value(live, index, t)
     if current != t.old_value:
-        raise DeployBlocked("DRIFT_DETECTED", f"live {t.resource} limit is {current!r}, proposal expects {t.old_value!r}")
-    record = {"previous": snapshot(live, index), "patch": patch_ops(t, index, t.old_value, t.new_value)}
+        raise DeployBlocked("DRIFT_DETECTED", f"live {t.field} is {current!r}, proposal expects {t.old_value!r}")
+    env_at = env_index(live, index, t.env_name) if t.resource == "env" else None
+    record = {"previous": snapshot(live, index), "patch": patch_ops(t, index, t.old_value, t.new_value, env_at)}
     dry = kube.json_patch(t, record["patch"], dry_run=True)
     if dry.returncode != 0:
         raise DeployBlocked("DRY_RUN_REFUSED", (dry.stderr or "server-side dry run failed").strip()[:300])
@@ -290,7 +334,7 @@ def apply_change(kube: Kubectl, t: Target) -> dict:
         # The JSON patch is atomic on the API server, but a client timeout or a dropped connection
         # can hide a patch that was applied. Re-read before calling it refused.
         error = (real.stderr or "kubectl patch failed").strip()[:300]
-        after = live_limit(kube.get_deployment(t), index, t.resource)   # unreadable -> caller reconciles
+        after = live_value(kube.get_deployment(t), index, t)   # unreadable -> caller reconciles
         if after == t.new_value:
             record["patched"] = True
             raise DeployFailed("PATCH_RESULT_UNCONFIRMED", error, applied=True, record=record)
@@ -306,7 +350,13 @@ def apply_change(kube: Kubectl, t: Target) -> dict:
 
 def rollback_change(kube: Kubectl, t: Target, index: int) -> dict:
     """Puts the previous value back (only if the live value is still the one we set)."""
-    ops = patch_ops(t, index, t.new_value, t.old_value)
+    env_at = None
+    if t.resource == "env":
+        try:
+            env_at = env_index(kube.get_deployment(t), index, t.env_name)
+        except DeployBlocked as exc:
+            return {"patch": None, "ok": False, "error": f"{exc.code}: {exc.detail}"}
+    ops = patch_ops(t, index, t.new_value, t.old_value, env_at)
     result = {"patch": ops}
     patched = kube.json_patch(t, ops, dry_run=False)
     result["patch_returncode"] = patched.returncode

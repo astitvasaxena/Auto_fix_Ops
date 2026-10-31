@@ -613,8 +613,8 @@ def _deploy(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
         return Outcome()
     kube = dep.Kubectl(cfg, deps.kube_runner)
     deployment = {"mode": "kubectl", "context": cfg.context, "target": target.key, "container": target.container,
-                  "resource": target.resource, "from": target.old_value, "to": target.new_value,
-                  "started_at": _iso(now)}
+                  "resource": target.resource, "field": target.field, "from": target.old_value,
+                  "to": target.new_value, "started_at": _iso(now)}
     try:
         record = dep.apply_change(kube, target)
     except dep.DeployBlocked as exc:   # nothing changed in the cluster
@@ -635,11 +635,12 @@ def _deploy(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
         return _reconcile(session_factory, run, proposal, snap, deps, kube, target, deployment,
                           f"deploy step interrupted ({exc.__class__.__name__})")
     deployment.update(record, finished_at=_iso(deps.now()), commands=kube.commands)
+    stabilization_s, timeout_s = rv.windows_for(target, vcfg)
     verification = {"started_at": _iso(deps.now()), "stable_since": None, "rounds": [], "baseline_restarts": None,
-                    "interval_s": vcfg.interval_s, "stabilization_s": vcfg.stabilization_s, "timeout_s": vcfg.timeout_s}
+                    "interval_s": vcfg.interval_s, "stabilization_s": stabilization_s, "timeout_s": timeout_s}
     return Outcome(stage=VERIFYING, updates={"deployment": deployment, "verification": verification},
                    events=[_event("DEPLOYED", deps.now(), target=target.key, value=target.new_value)],
-                   note=f"deployed {target.resource} limit {target.old_value} -> {target.new_value} to {target.key}",
+                   note=f"deployed {target.field} {target.old_value} -> {target.new_value} to {target.key}",
                    next_in=vcfg.interval_s)
 
 
@@ -651,7 +652,7 @@ def _reconcile(session_factory, run, proposal, snap, deps, kube, target, deploym
     try:
         live = kube.get_deployment(target)
         index = dep.container_index(live, target.container)
-        value = dep.live_limit(live, index, target.resource)
+        value = dep.live_value(live, index, target)
     except Exception as exc:
         return Outcome(stage=DEPLOYING, updates={"deployment": deployment}, next_in=30,
                        blocked=("DEPLOY_STATE_UNKNOWN", f"{why}; live state unreadable ({exc.__class__.__name__})"))
@@ -664,7 +665,7 @@ def _reconcile(session_factory, run, proposal, snap, deps, kube, target, deploym
                        blocked=("DEPLOY_INTERRUPTED", f"{why}; the live value is unchanged, safe to retry"))
     return Outcome(stage=FAILED, updates={"deployment": deployment}, incident=("ESCALATED",),
                    events=[_event("DRIFT_DETECTED", deps.now(), live=str(value))],
-                   note=f"{why}; live {target.resource} limit is {value}, changed by someone else - manual review needed")
+                   note=f"{why}; live {target.field} is {value}, changed by someone else - manual review needed")
 
 
 def _recover_deploying(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
@@ -692,14 +693,16 @@ def _verify_round(session_factory, run, proposal, snap, deps, token, now) -> Out
         return Outcome(blocked=(exc.code, exc.detail), next_in=60)
     kube = dep.Kubectl(cfg, deps.kube_runner)
     verification = dict(run.verification or {})
+    started = _parse(verification.get("started_at")) or now
     result = rv.run_round(kube, target, vcfg, snap["alert_name"], deps.http_get, deps.prom_query,
-                          verification.get("baseline_restarts"))
+                          verification.get("baseline_restarts"), since_deploy_s=(now - started).total_seconds())
     if verification.get("baseline_restarts") is None and result["restarts"]:
         verification["baseline_restarts"] = result["restarts"]
     rounds = list(verification.get("rounds") or []) + [{"at": _iso(now), "ok": result["ok"], "checks": result["checks"]}]
     verification["rounds"] = rounds[-MAX_ROUNDS_KEPT:]
     verification["round_count"] = int(verification.get("round_count") or 0) + 1
-    started = _parse(verification.get("started_at")) or now
+    stabilization_s = verification.get("stabilization_s") or vcfg.stabilization_s
+    timeout_s = verification.get("timeout_s") or vcfg.timeout_s
     last = _parse(verification.get("last_round_at"))
     verification["last_round_at"] = _iso(now)
     if last is not None and (now - last).total_seconds() > 2 * vcfg.interval_s:
@@ -707,15 +710,15 @@ def _verify_round(session_factory, run, proposal, snap, deps, token, now) -> Out
     if result["ok"]:
         stable_since = _parse(verification.get("stable_since")) or now
         verification["stable_since"] = _iso(stable_since)
-        if (now - stable_since).total_seconds() >= vcfg.stabilization_s:
+        if (now - stable_since).total_seconds() >= stabilization_s:
             verification.update(result="PASSED", finished_at=_iso(now))
             return Outcome(stage=RESOLVED, updates={"verification": verification},
                            incident=("VERIFIED", "RESOLVED"),
                            events=[_event("VERIFIED", now, rounds=verification["round_count"])],
-                           note=f"recovery verified: all checks passed for {vcfg.stabilization_s}s")
+                           note=f"recovery verified: all checks passed for {stabilization_s}s")
     else:
         verification["stable_since"] = None
-    if (now - started).total_seconds() >= vcfg.timeout_s:
+    if (now - started).total_seconds() >= timeout_s:
         verification.update(result="FAILED", finished_at=_iso(now))
         failing = [c["name"] for c in result["checks"] if not c["ok"]]
         deployment = dict(run.deployment or {})
@@ -774,8 +777,11 @@ def _revert_pr(run, proposal, snap, deps) -> dict:
 
 def _pr_title(proposal, snap, shadow: bool) -> str:
     values = proposal.proposed_values or {}
-    resource = (values.get("field_path") or "").rsplit(".", 1)[-1]
-    return (f"{'[SHADOW] ' if shadow else ''}[AutoFixOps] {proposal.action_type}: {resource} limit "
+    try:
+        what = _target(proposal).field
+    except dep.DeployBlocked:
+        what = (values.get("field_path") or "").rsplit(".", 1)[-1]
+    return (f"{'[SHADOW] ' if shadow else ''}[AutoFixOps] {proposal.action_type}: {what} "
             f"{values.get('old_value')} -> {values.get('new_value')} (incident {snap['incident_id'][:8]})")
 
 

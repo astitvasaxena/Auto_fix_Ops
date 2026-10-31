@@ -37,7 +37,8 @@ from api.events import emit_sync
 from engine.summarizer import ContextSummarizer
 from engine.baseline import RuleBasedDiagnosisEngine
 from engine.ai_diagnostics import (
-    AIDiagnosisEngine, build_analysis_context, build_runbook_query, retrieve_runbook_evidence,
+    AIDiagnosisEngine, build_analysis_context, build_evidence_query, build_runbook_query,
+    retrieve_runbook_evidence,
 )
 from engine.memory import QdrantMemoryStore
 from engine.policy import PolicyDecisionEngine
@@ -95,7 +96,15 @@ def _generate_ai_report(incident, context_doc: dict, summary, rule_verdict: dict
     min_score = float(os.getenv("RAG_RUNBOOK_MIN_SCORE", "0.35"))
     top_k = int(os.getenv("RAG_RUNBOOK_TOP_K", "3"))
     query = build_runbook_query(context, rule_verdict)
-    hits, rag_status = retrieve_runbook_evidence(QdrantMemoryStore(), query, top_k, min_score)
+    store = QdrantMemoryStore()
+    hits, rag_status = retrieve_runbook_evidence(store, query, top_k, min_score)
+    # CPU starvation or a leak behind a "target down" alert: also retrieve by the evidence alone.
+    evidence_query = build_evidence_query(context)
+    if evidence_query:
+        more, _ = retrieve_runbook_evidence(store, evidence_query, top_k, min_score)
+        seen = {h["runbook_id"] for h in hits}
+        hits += [h for h in more if h["runbook_id"] not in seen]
+        rag_status = "ok" if hits else rag_status
     logger.info(
         f"[TRACE:{incident_id}] [AI ANALYST] Runbook RAG status={rag_status} "
         f"hits={[(h['title'], h['similarity_score']) for h in hits]}"
@@ -111,7 +120,7 @@ def _generate_ai_report(incident, context_doc: dict, summary, rule_verdict: dict
         )
 
     rag_meta = {
-        "collection": "operational_runbooks", "query": query,
+        "collection": "operational_runbooks", "query": query, "evidence_query": evidence_query,
         "min_score": min_score, "top_k": top_k, "status": rag_status,
     }
     return ai_engine.analyze_incident(context, rule_verdict, hits, rag_meta,

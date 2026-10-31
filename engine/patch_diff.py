@@ -85,8 +85,27 @@ def _mapping_get(node, key):
     return None
 
 
+def _path_text(field_path: tuple) -> str:
+    return ".".join(f"[{step[0]}={step[1]}]" if isinstance(step, tuple) else step for step in field_path)
+
+
+def _sequence_item(node, key: str, value: str):
+    """The one mapping in a sequence whose `key` scalar equals value (None if there is none)."""
+    if not isinstance(node, yaml.SequenceNode):
+        raise PatchDiffError("UNSUPPORTED_MANIFEST", f"expected a list of items with {key}={value}")
+    found = []
+    for item in node.value:
+        name = _mapping_get(item, key) if isinstance(item, yaml.MappingNode) else None
+        if isinstance(name, yaml.ScalarNode) and name.value == value:
+            found.append(item)
+    if len(found) > 1:
+        raise PatchDiffError("UNSUPPORTED_MANIFEST", f"{key}={value} appears more than once")
+    return found[0] if found else None
+
+
 def locate_container_scalar(text: str, field_path: tuple) -> dict:
-    """Finds spec.template.spec.containers[0].<field_path> as a single-line block scalar."""
+    """Finds spec.template.spec.containers[0].<field_path> as a single-line block scalar.
+    A ("name", X) step in field_path selects the list item whose name is X."""
     nodes = assert_plain_document(text)
     if len(nodes) != 1:
         raise PatchDiffError("UNSUPPORTED_MANIFEST", "exactly one YAML document is required")
@@ -97,9 +116,9 @@ def locate_container_scalar(text: str, field_path: tuple) -> dict:
         raise PatchDiffError("UNSUPPORTED_MANIFEST", "exactly one container is required")
     node = node.value[0]
     for key in field_path:
-        node = _mapping_get(node, key)
+        node = _sequence_item(node, *key) if isinstance(key, tuple) else _mapping_get(node, key)
         if node is None:
-            raise PatchDiffError("CURRENT_VALUE_MISSING", ".".join(field_path) + " is not set")
+            raise PatchDiffError("CURRENT_VALUE_MISSING", _path_text(field_path) + " is not set")
     if not isinstance(node, yaml.ScalarNode):
         raise PatchDiffError("UNSUPPORTED_MANIFEST", "target value is not a scalar")
     if node.style not in (None, '"', "'"):
@@ -218,6 +237,8 @@ def parse_unified_diff_strict(diff_text: str, expected_rel: str) -> dict:
 
 
 _PLUS_LINE_RE = re.compile(r"^(\s*)(memory|cpu):\s*([\"']?)([0-9]+(?:Mi|Gi|m)?)\3(\s+#.*)?$")
+# A feature-flag env value: quoted (Kubernetes env values are strings), true or false.
+_FLAG_LINE_RE = re.compile(r"^(\s*)(value):\s*([\"'])(true|false)\3(\s+#.*)?$")
 
 
 def check_diff_policy(parsed: dict, base_lines: list, located_line: int, field_key: str):
@@ -231,9 +252,10 @@ def check_diff_policy(parsed: dict, base_lines: list, located_line: int, field_k
         raise PatchDiffError("DIFF_POLICY_VIOLATION", "exactly one line may change")
     if minus[0] != base_lines[located_line - 1]:
         raise PatchDiffError("DIFF_POLICY_VIOLATION", "removed line is not the located limit line")
-    old_m, new_m = _PLUS_LINE_RE.fullmatch(minus[0]), _PLUS_LINE_RE.fullmatch(plus[0])
+    line_re = _FLAG_LINE_RE if field_key == "value" else _PLUS_LINE_RE
+    old_m, new_m = line_re.fullmatch(minus[0]), line_re.fullmatch(plus[0])
     if not old_m or not new_m or new_m.group(2) != field_key:
-        raise PatchDiffError("DIFF_POLICY_VIOLATION", "changed line is not a resource-limit line")
+        raise PatchDiffError("DIFF_POLICY_VIOLATION", "changed line is not a resource-limit or feature-flag line")
     for group in (1, 2, 3, 5):
         if old_m.group(group) != new_m.group(group):
             raise PatchDiffError("DIFF_POLICY_VIOLATION", "indent, key, quoting or comment changed")
