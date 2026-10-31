@@ -76,6 +76,22 @@ test('blocked reasons are explained and stability progress is bounded', () => {
   assert.equal(stabilityProgress({}), 0);
 });
 
+test('chaos mode and escalated remediation are shown from backend data only', async () => {
+  const { chaosMode, CHAOS_FAULTS } = await import('../lib/pipeline.mjs');
+  assert.equal(chaosMode(null), 'local');
+  assert.equal(chaosMode({ chaos_enabled: true, evidence: { available: false } }), 'local');
+  assert.equal(chaosMode({ chaos_enabled: true, evidence: { available: true } }), 'kubernetes');
+  assert.deepEqual(CHAOS_FAULTS.map((f) => f.id), ['memory_leak', 'cpu_spike', 'crash_loop']);
+  const inc = { status: 'ESCALATED', source: 'alertmanager',
+    status_timeline: tl('CONTEXT_BUILT', 'DIAGNOSED', 'POLICY_APPROVED', 'REMEDIATING', 'PENDING_PR_MERGE', 'ESCALATED') };
+  const rolledBack = pipelineStates(inc, { stage: 'ROLLED_BACK', final: true, deployment: { patched: true } });
+  assert.equal(rolledBack[at('remediation')], 'completed');
+  assert.equal(rolledBack[at('verification')], 'failed');
+  const noPr = pipelineStates(inc, { stage: 'FAILED', final: true, deployment: null });
+  assert.equal(noPr[at('remediation')], 'failed');
+  assert.equal(pipelineStates({ ...inc, status_timeline: tl('DIAGNOSED', 'ESCALATED') })[at('policy')], 'warning');
+});
+
 test('Kubernetes target badge and CI status come only from backend data', async () => {
   const { podHealth, ciInfo } = await import('../lib/pipeline.mjs');
   assert.equal(podHealth(null).label, 'UNKNOWN');

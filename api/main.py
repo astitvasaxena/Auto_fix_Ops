@@ -78,7 +78,7 @@ _CLOSED_STATUSES = [
 
 
 # Alerts about the same target that describe one outage (memory pressure turning into restarts).
-_ALERT_GROUPS = (("TargetAppDown", "TargetAppCrashLoop", "TargetAppMemoryLeak", "HighMemoryUsage"),)
+_ALERT_GROUPS = (("TargetAppDown", "TargetAppCrashLoop", "TargetAppMemoryLeak", "HighMemoryUsage", "HighCPUUsage"),)
 
 
 def _incident_source(incident) -> str:

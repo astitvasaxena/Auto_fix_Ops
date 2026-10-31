@@ -29,8 +29,13 @@ spec:
         - containerPort: 8000
         envFrom:
         - configMapRef:
-            name: target-app-chaos   # crash-loop chaos switch (STARTUP_MEMORY_MB); optional
+            name: target-app-chaos   # chaos faults (engine/k8s_chaos.py); optional
             optional: true
+        env:
+        # Feature flag for the response cache. The Memory Leak chaos fault leaks in this cache;
+        # AutoFixOps may propose "false" (DISABLE_FEATURE_FLAG) through a reviewed pull request.
+        - name: RESPONSE_CACHE_ENABLED
+          value: "true"
         resources:
           requests:
             memory: "64Mi"
@@ -48,7 +53,7 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /health
+            path: /ready   # fails while background work is too far behind (CPU starvation)
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 5

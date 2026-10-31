@@ -127,6 +127,34 @@ API server's service proxy (`kube-service://...`).
    then verifies deployment, pods, health, alert and headroom for the stabilization window → **RESOLVED**.
    If verification fails it restores the previous limit, opens a revert PR and marks the incident FAILED.
 
+**The three chaos faults (dashboard Chaos page, Kubernetes mode, or `k8s_demo.py chaos ...`).**
+Each one is a value in the ConfigMap `target-app-chaos` that the target app reads at start-up, plus
+an expiry (`CHAOS_TTL_MINUTES`, default 30); injection restarts the pod, so the fault is real and
+persists across restarts until it expires or is reset. The page never creates an incident: only
+Prometheus/Alertmanager do.
+
+| Fault | What happens in the pod | Detected by | What AutoFixOps does |
+|---|---|---|---|
+| Crash Loop (`crashloop`) | start-up needs the whole memory limit: OOMKilled at every start, CrashLoopBackOff, target down | TargetAppDown | memory limit increase (2x, the largest bounded value) after approval, PR, CI and merge; verified recovery |
+| Memory Leak (`memoryleak`) | the response cache stops evicting and grows 40 MB/min until OOMKilled, again after every restart (repeated outages, then CrashLoopBackOff) | TargetAppMemoryLeak / HighMemoryUsage, later TargetAppDown | never a larger limit (a leak only gets killed later); turns the feature off instead: `RESPONSE_CACHE_ENABLED` `"true"` → `"false"` in `deployment.yaml` (DISABLE_FEATURE_FLAG) after approval, PR, CI and merge; verified recovery includes memory no longer growing |
+| CPU Spike (`cpuspike`) | background work needs 130% of the CPU limit; its backlog grows, `/ready` fails and the pod leaves service: Running, 0/1 Ready, no restarts | TargetAppDown (HighCPUUsage if it is caught while still serving) | CPU limit increase (2x: throttling hides the real demand, the work then uses ~65%) after approval, PR, CI and merge; verified recovery |
+
+Each fault needs the current target image and `deployment.yaml` (readiness probe `/ready`, the
+`RESPONSE_CACHE_ENABLED` flag); injection refuses with `CHAOS_INVALID` otherwise. Order matters:
+**import the new image first, then** `kubectl --context docker-desktop apply -f kubernetes_integration/target_app/deployment.yaml`
+(an old image has no `/ready`, so the pod would never become ready). Then reload Prometheus
+(`Invoke-WebRequest -Method Post http://localhost:9090/-/reload`) and restart the API and worker.
+
+A CPU-limit or feature-flag fix is verified for at least 180 s, whatever `VERIFY_STABILIZATION_SECONDS`
+says (the timeout grows to fit): at the old values these faults take a minute or more to show again.
+A leak fix also needs memory measured flat for at least 60 s after the deployment.
+
+A merged fix stays in Git: to repeat Memory Leak or CPU Spike afterwards, revert that remediation PR
+(injection explains this if you try). Crash Loop always sizes itself to the current memory limit.
+
+A remediation whose deployment or verification fails is rolled back and the incident is
+**ESCALATED** to a human (close it with a reason on the incident page once handled).
+
 **Reset for another run:** `git pull` (main now has the new limit; it must equal your working tree),
 `python scripts/k8s_demo.py chaos reset`, and to remove everything `python scripts/k8s_demo.py teardown`.
 

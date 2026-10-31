@@ -22,13 +22,20 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 TARGET_MANIFEST = "kubernetes_integration/target_app/deployment.yaml"
 
-# The only files and fields a proposal may change. Code constant by design.
+# Feature flags (container env entries) a proposal may turn off, from "true" to "false" only.
+FLAG_ACTION = "DISABLE_FEATURE_FLAG"
+FEATURE_FLAG = "RESPONSE_CACHE_ENABLED"
+FEATURE_FLAGS = frozenset({FEATURE_FLAG})
+
+# The only files and fields a proposal may change. Code constant by design. A ("name", X) step
+# selects the one list item whose name is X (container env entries).
 ALLOWED_PATCH_TARGETS = {
     TARGET_MANIFEST: {
         "kinds": frozenset({"Deployment"}),
         "fields": {
             "INCREASE_MEMORY_LIMIT": ("resources", "limits", "memory"),
             "INCREASE_CPU_LIMIT": ("resources", "limits", "cpu"),
+            FLAG_ACTION: ("env", ("name", FEATURE_FLAG), "value"),
         },
     },
 }

@@ -167,7 +167,7 @@ def close_incident(incident_id: uuid.UUID, body: ReasonIn, actor=Depends(require
 
 class K8sChaosIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    fault: str = Field(pattern=r"^(crash_loop|reset)$")
+    fault: str = Field(pattern=r"^(crash_loop|memory_leak|cpu_spike|reset)$")
     confirmation: str
 
 
@@ -203,14 +203,12 @@ def kubernetes_target_status():
 
 @router.post("/chaos/kubernetes", dependencies=[Depends(require_json)])
 def kubernetes_chaos(body: K8sChaosIn, actor=Depends(require_approver)):
-    """Crash-loop chaos on the allowlisted Kubernetes target. Opt-in (CHAOS_K8S_ENABLED=true).
+    """Chaos on the allowlisted Kubernetes target (crash_loop, memory_leak, cpu_spike or reset).
+    Opt-in (CHAOS_K8S_ENABLED=true); every fault expires after CHAOS_TTL_MINUTES.
     It never creates an incident: detection must come from Prometheus/Alertmanager."""
-    import requests
-
     from api.config_helpers import is_system_disabled
     from engine import deployer as dep
     from engine import k8s_chaos
-    from engine.telemetry import DEFAULT_SCRAPE_JOB
 
     if os.getenv("CHAOS_K8S_ENABLED", "false").strip().lower() != "true":
         raise HTTPException(status_code=403, detail="CHAOS_DISABLED: set CHAOS_K8S_ENABLED=true to allow Kubernetes chaos")
@@ -223,17 +221,7 @@ def kubernetes_chaos(body: K8sChaosIn, actor=Depends(require_approver)):
         if body.fault == "reset":
             result = k8s_chaos.reset(cfg, target)
         else:
-            baseline = 50 * 1024 * 1024   # used only if Prometheus has no current reading
-            try:
-                job = os.getenv("TARGET_SCRAPE_JOB", DEFAULT_SCRAPE_JOB)
-                resp = requests.get(f"{os.getenv('PROMETHEUS_URL', 'http://localhost:9090')}/api/v1/query",
-                                    params={"query": f'process_resident_memory_bytes{{job="{job}"}}'}, timeout=5)
-                values = resp.json().get("data", {}).get("result", [])
-                if values:
-                    baseline = float(values[0]["value"][1])
-            except Exception:
-                pass
-            result = k8s_chaos.inject_crash_loop(cfg, target, baseline)
+            result = k8s_chaos.inject(cfg, target, body.fault)
     except dep.DeployBlocked as exc:
         raise HTTPException(status_code=409, detail=f"{exc.code}: {exc.detail}")
     logger.info(f"[CHAOS] Kubernetes {body.fault}: {result} (by {actor.get('identity') or actor.get('client_host')})")

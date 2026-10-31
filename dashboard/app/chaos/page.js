@@ -2,30 +2,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../../lib/api';
 import KubernetesTargetCard from '../../components/KubernetesTargetCard';
+import { CHAOS_FAULTS, chaosMode } from '../../lib/pipeline.mjs';
 
-const FAULTS = [
-  {
-    id: 'memory_leak',
-    name: 'Memory Leak',
-    icon: '🧠',
-    desc: 'Triggers /leak endpoint. Allocates memory until OOMKilled.',
-    severity: 'HIGH',
-  },
-  {
-    id: 'cpu_spike',
-    name: 'CPU Spike',
-    icon: '🔥',
-    desc: 'Triggers /cpu endpoint. Burns CPU for 60s via tight loops.',
-    severity: 'MEDIUM',
-  },
-  {
-    id: 'crash_loop',
-    name: 'Crash Loop',
-    icon: '💀',
-    desc: 'Triggers /crash endpoint. Forces process exit → CrashLoopBackOff.',
-    severity: 'HIGH',
-  },
-];
+// The same three faults run in one of two modes (see lib/pipeline.mjs CHAOS_FAULTS):
+// - kubernetes: a persistent fault in the target pod (ConfigMap target-app-chaos, expires by itself);
+//   Prometheus/Alertmanager must detect it - this page never creates an incident.
+// - local: the legacy HTTP endpoints of the local target process (target URL below).
+const FAULTS = CHAOS_FAULTS;
 
 const COOLDOWN_SECONDS = 60;
 
@@ -68,7 +51,13 @@ export default function ChaosPage() {
   const [loading, setLoading] = useState({});
   const [cooldowns, setCooldowns] = useState({});
   const [systemMode, setSystemMode] = useState('ACTIVE');
+  const [k8s, setK8s] = useState(null);   // GET /target/kubernetes: decides the mode
   const intervalRef = useRef(null);
+  const mode = chaosMode(k8s);
+
+  useEffect(() => {
+    api.getKubernetesTarget().then(setK8s).catch(() => setK8s(null));
+  }, []);
 
   // Fetch system mode
   useEffect(() => {
@@ -106,6 +95,17 @@ export default function ChaosPage() {
 
     setLoading((l) => ({ ...l, [faultId]: true }));
     try {
+      if (mode === 'kubernetes') {
+        const res = await api.injectKubernetesChaos(faultId, 'CONFIRM');
+        setResults((r) => ({ ...r, [faultId]: {
+          type: 'success',
+          msg: `${res.expected}. Expires in ${res.expires_in_minutes} min. No incident is created here: watch Prometheus/Alertmanager.`,
+        }}));
+        api.getKubernetesTarget().then(setK8s).catch(() => {});
+        setConfirms((c) => ({ ...c, [faultId]: '' }));
+        setLoading((l) => ({ ...l, [faultId]: false }));
+        return;
+      }
       const res = await api.injectChaos({
         fault_type: faultId,
         target_url: targetUrl,
@@ -178,8 +178,13 @@ export default function ChaosPage() {
       {/* Kubernetes target: live pod health and the reproducible crash-loop fault */}
       <KubernetesTargetCard showChaos />
 
-      {/* Target URL */}
-      <div className="card mb-16">
+      <p className="text-sm text-muted mb-16">
+        Mode: <strong>{mode === 'kubernetes' ? 'Kubernetes target (real pod faults, detected by Prometheus)'
+          : 'local target process (legacy HTTP faults; creates a ChaosInjection incident directly)'}</strong>
+      </p>
+
+      {/* Target URL (local mode only) */}
+      {mode === 'local' && <div className="card mb-16">
         <div className="form-group" style={{ marginBottom: 0 }}>
           <label>Target Application URL</label>
           <input
@@ -191,7 +196,7 @@ export default function ChaosPage() {
             disabled={isDisabled}
           />
         </div>
-      </div>
+      </div>}
 
       {/* Chaos Cards */}
       <div className="chaos-zone">
@@ -204,7 +209,8 @@ export default function ChaosPage() {
             return (
               <div className="chaos-card" key={fault.id} style={{ opacity: isDisabled ? 0.5 : 1 }}>
                 <h4>{fault.icon} {fault.name}</h4>
-                <p>{fault.desc}</p>
+                <p>{fault[mode].desc}</p>
+                <p className="text-sm text-muted">Expected: {fault[mode].outcome}</p>
                 <div className="severity-row">
                   Severity: <span style={{ color: fault.severity === 'HIGH' ? 'var(--error)' : 'var(--warning)', fontWeight: 600 }}>
                     {fault.severity}

@@ -12,6 +12,7 @@ ALLOWED_ACTIONS = {
     "INCREASE_MEMORY_LIMIT",
     "INCREASE_CPU_LIMIT",
     "ROLLBACK_DEPLOYMENT",
+    "DISABLE_FEATURE_FLAG",   # allowlisted flags only, "true" -> "false" (engine/patch_safety.py)
     "ESCALATE",
 }
 

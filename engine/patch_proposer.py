@@ -2,8 +2,10 @@
 AI patch proposer (Stage 2): propose and validate, never apply.
 ================================================================
 Given a DIAGNOSED incident's stored ai_report, proposes a bounded memory or
-CPU limit increase for the single allowlisted manifest and validates it in a
-temporary sandbox. The result is stored in patch_proposals. Nothing here
+CPU limit increase, or turning off the allowlisted feature flag that a measured
+memory leak runs in (DISABLE_FEATURE_FLAG, "true" -> "false"), for the single
+allowlisted manifest and validates it in a temporary sandbox. The result is
+stored in patch_proposals. Nothing here
 applies, commits, pushes, deploys or opens a PR; human approval is Stage 3.
 
 Flow
@@ -86,17 +88,19 @@ from engine.patch_diff import (
 )
 from engine.patch_generator import HARD_CAPS, PatchGenerator, format_cpu, format_memory, parse_cpu, parse_memory
 from engine.patch_safety import (
-    TARGET_MANIFEST, PatchSafetyError, allowlisted_field, git_blob_sha, read_allowlisted_file,
-    rehash, validate_repo_relative_path,
+    FEATURE_FLAG, FLAG_ACTION, TARGET_MANIFEST, PatchSafetyError, allowlisted_field, git_blob_sha,
+    read_allowlisted_file, rehash, validate_repo_relative_path,
 )
 from engine.policy import CONFIDENCE_FLOOR, RESTRICTED_NAMESPACES
 from engine.routing_policy import (
     APPROVED, AUTOMATIC_AI, HUMAN_APPROVAL_REQUIRED, HUMAN_APPROVED, threshold_conflict,
 )
 from engine.runbooks import RUNBOOK_VERSION, load_runbooks
+from engine.telemetry import LEAK_GROWTH_MIB_PER_MIN
 
 PROPOSER_VERSION = 1
 PROMPT_VERSION = "patch-decision/2"
+FLAG_PROMPT_VERSION = "flag-decision/1"
 
 RUNNING, VALIDATED, NOT_GENERATED, REJECTED, FAILED = (
     "RUNNING", "VALIDATED", "NOT_GENERATED", "REJECTED", "FAILED")
@@ -119,7 +123,16 @@ ACTIONS = {
         "conflicting_rule": "MEMORY_LEAK_OOM_RISK", "runbook": "k8s-cpu-limits-throttling",
         "parse": parse_cpu, "format": format_cpu,
     },
+    # A measured leak in a feature that a flag can turn off: the official memory guidance says a larger
+    # limit only delays the next kill and the fix belongs in the application.
+    FLAG_ACTION: {
+        "resource": "flag", "incident_type": "HIGH_MEMORY", "peak_key": "memory_peak",
+        "conflicting_rule": "CPU_RESOURCE_STARVATION", "runbook": "k8s-oomkilled-memory-pressure",
+        "parse": None, "format": None,
+    },
 }
+# A leak can be reported while memory climbs, after OOM kills, or once the target is down.
+FLAG_INCIDENT_TYPES = ("HIGH_MEMORY", "CRASH_LOOP", "TARGET_APP_DOWN")
 CANDIDATE_MULTIPLIERS = (1.25, 1.5, 2.0)
 DECLINE_REASONS = ("NONE", "INSUFFICIENT_EVIDENCE", "LEAK_SUSPECTED", "NOT_CAPACITY_PROBLEM", "TARGET_UNCLEAR")
 TELEMETRY_FACT_IDS = ("F3", "F4")
@@ -142,6 +155,17 @@ VERIFY_HEADROOM = 0.80
 # (on nodes with swap the container is not OOMKilled; it thrashes and fails its probes).
 CRASH_LOOP_MIN_UTILISATION = 1.0
 CRASH_LOOP_RUNBOOK = "k8s-repeated-container-failure"
+# Memory still growing at least LEAK_GROWTH_MIB_PER_MIN (engine.telemetry) when the incident is built is a
+# leak: a larger limit only delays the next OOM kill ("the fix belongs in the application"), so no memory
+# increase is proposed. The leaking feature may be turned off (FLAG_ACTION); otherwise a human decides.
+# A target that is down because it is starved of CPU: Kubernetes reports the pod running but not ready
+# (readiness probe failures), never restarted or OOMKilled, and CPU was measured at least this close to its
+# limit. Throttling hides the real demand, so only the largest bounded value is offered.
+CPU_STARVED_MIN_UTILISATION = 0.90
+# Usage pinned at the limit (CPU throttled, memory held at the cgroup limit) hides the real demand:
+# offer only the largest bounded value, as for OOMKilled evidence. Usage measured clearly above the
+# limit (memory on a node with swap) is a real measurement and keeps the normal menu.
+SATURATED_BAND = (0.98, 1.05)
 POLICY_MAX_FACTOR = 2.0
 MAX_PLAUSIBLE_UTILISATION = 1.5   # a peak far above the limit means the manifest is not what ran
 EXIT_INTERRUPTED = 130
@@ -376,6 +400,47 @@ def _restart_evidence(raw_context) -> Optional[dict]:
             "exit_code": s.get("last_exit_code") if isinstance(s.get("last_exit_code"), int) else None}
 
 
+def _k8s_summary(raw_context) -> Optional[dict]:
+    k8s = (raw_context or {}).get("kubernetes") if isinstance(raw_context, dict) else None
+    if not isinstance(k8s, dict) or k8s.get("available") is not True or not isinstance(k8s.get("summary"), dict):
+        return None
+    return k8s["summary"]
+
+
+def _count(value) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _cpu_starved_evidence(raw_context) -> Optional[dict]:
+    """Kubernetes evidence that the target is out of service while running: pods running, none ready,
+    readiness probe failures, no restarts and no termination (CPU limits throttle, they do not kill)."""
+    s = _k8s_summary(raw_context)
+    if s is None:
+        return None
+    pods, ready, restarts, failures = (_count(s.get(k)) for k in ("pods", "ready_pods", "restart_count",
+                                                                   "readiness_failures"))
+    if not (pods and ready == 0 and restarts == 0 and failures and not s.get("last_termination_reason")
+            and not s.get("waiting_reason")):
+        return None
+    fields = {key: s.get(key) for key in ("namespace", "deployment", "container", "live_cpu_limit")}
+    if not all(_plain_label(v) for v in fields.values()):
+        return None
+    return {**fields, "pods": pods, "readiness_failures": failures}
+
+
+def _flag_evidence(raw_context) -> Optional[dict]:
+    """The feature flag's live value on the target container, as Kubernetes reports it."""
+    s = _k8s_summary(raw_context)
+    flags = s.get("feature_flags") if s else None
+    if not isinstance(flags, dict) or not isinstance(flags.get(FEATURE_FLAG), str):
+        return None
+    fields = {key: s.get(key) for key in ("namespace", "deployment", "container")}
+    if not all(_plain_label(v) for v in fields.values()):
+        return None
+    return {**fields, "value": flags[FEATURE_FLAG], "restart_count": _count(s.get("restart_count")),
+            "last_termination_reason": _plain_label(s.get("last_termination_reason"))}
+
+
 def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=None) -> dict:
     if system_mode == "DISABLED":
         raise ProposalStop(NOT_GENERATED, "SYSTEM_DISABLED", "kill switch is DISABLED")
@@ -415,6 +480,7 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
         raise ProposalStop(NOT_GENERATED, "UNSUPPORTED_ACTION", f"{action} is not supported in Stage 2")
     rule_class = rule_engine.get("root_cause_classification")
     memory_action = action == "INCREASE_MEMORY_LIMIT"
+    flag_action = action == FLAG_ACTION
     oom = _oom_evidence(raw_context) if memory_action else None
     restarting = _restart_evidence(raw_context) if memory_action else None
     crash_loop = parsed.incident_type == "CRASH_LOOP"
@@ -422,11 +488,20 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
     # terminations, or repeated kills/restarts together with a measured peak at the limit
     # (checked against the manifest below).
     crash_loop_memory = crash_loop and (oom is not None or restarting is not None)
-    if (parsed.incident_type != spec["incident_type"] and not crash_loop_memory) or rule_class == spec["conflicting_rule"]:
+    # A target that is down is a CPU problem only with Kubernetes evidence that it is running but
+    # not ready, never killed (and CPU measured near the limit, checked against the manifest below).
+    starved = _cpu_starved_evidence(raw_context) if action == "INCREASE_CPU_LIMIT" else None
+    cpu_down = parsed.incident_type == "TARGET_APP_DOWN" and starved is not None
+    type_ok = (parsed.incident_type == spec["incident_type"] or crash_loop_memory or cpu_down
+               or (flag_action and parsed.incident_type in FLAG_INCIDENT_TYPES))
+    if not type_ok or rule_class == spec["conflicting_rule"]:
         detail = f"{action} conflicts with incident_type {parsed.incident_type} / rule {_plain_label(rule_class)}"
         if crash_loop and memory_action:
             detail += ("; a crash loop needs Kubernetes evidence of repeated OOMKilled terminations or of "
                        "repeated restarts with memory measured at the limit")
+        if parsed.incident_type == "TARGET_APP_DOWN" and action == "INCREASE_CPU_LIMIT":
+            detail += ("; a down target needs Kubernetes evidence that its pods are running but not ready "
+                       "(readiness probe failures, no restarts)")
         raise ProposalStop(NOT_GENERATED, "INCONSISTENT_DIAGNOSIS", detail)
     # The one routing threshold, never the (validated, but possibly forced) settings value.
     min_confidence = CONFIDENCE_FLOOR
@@ -456,10 +531,27 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
             return f"raw context says {spec['resource']} telemetry was unavailable"
         return None
 
+    growth = raw_tel.get("memory_growth_mib_per_min")
+    if memory_action and _is_real(growth) and growth >= LEAK_GROWTH_MIB_PER_MIN:
+        raise ProposalStop(NOT_GENERATED, "LEAK_SUSPECTED",
+                           f"memory was still growing {growth:.1f} MiB/min when the incident was built; a larger "
+                           f"limit only delays the next OOM kill (turn off the leaking feature, fix or roll back)")
+
     # Evidence: either measured usage near the limit, or (memory only) repeated OOMKilled
     # terminations reported by Kubernetes. A crash-looping container has no meaningful usage.
+    # A feature flag is turned off only for a measured leak in a feature the live container runs with.
+    flag = _flag_evidence(raw_context) if flag_action else None
     problem = telemetry_problem()
-    if oom is not None and (problem or crash_loop):   # OOMKilled is direct evidence for a crash loop
+    if flag_action:
+        if not (_is_real(growth) and growth >= LEAK_GROWTH_MIB_PER_MIN):
+            raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
+                               f"turning a feature off needs memory measured still growing (>= "
+                               f"{LEAK_GROWTH_MIB_PER_MIN:g} MiB/min); growth is {growth if _is_real(growth) else 'unknown'}")
+        if flag is None or flag["value"] != "true":
+            raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
+                               f"Kubernetes does not report {FEATURE_FLAG}=\"true\" on the live container")
+        evidence_mode, peak = "leak", None
+    elif oom is not None and (problem or crash_loop):   # OOMKilled is direct evidence for a crash loop
         evidence_mode, peak = "oom_killed", None
     elif problem:
         if crash_loop and memory_action:
@@ -483,7 +575,8 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
                            f"official runbook {' or '.join(accepted)} was not retrieved for this incident")
     return {"report": report, "parsed": parsed, "action": action, "spec": spec,
             "peak": peak, "evidence_mode": evidence_mode, "oom": oom, "restarting": restarting,
-            "crash_loop": crash_loop,
+            "crash_loop": crash_loop, "cpu_down": cpu_down, "starved": starved, "flag": flag,
+            "growth": growth if _is_real(growth) else None,
             "runbook": runbook, "labels": labels, "alert": alert,
             "rule_action": rule_action, "routing": routing,
             "rule_class": _plain_label(rule_class) or ("(withheld)" if rule_class else None)}
@@ -671,6 +764,14 @@ def classify_llm_error(exc: BaseException) -> str:
 def _build_prompt(ctx: dict) -> str:
     facts = "\n".join(f"{f['id']}: {f['text']}" for f in ctx["facts"])
     guidance = "\n".join(f"- {g}" for g in ctx["guidance"])
+    if ctx.get("flag"):
+        rules = (f"1. PROPOSE only if the facts ({', '.join(TELEMETRY_FACT_IDS)}) show memory still growing while the\n"
+                 f"   feature is on; cite at least one of them. \"false\" turns the feature off.\n"
+                 f"2. If the evidence does not show a leak in this feature, DECLINE.")
+    else:
+        rules = (f"1. PROPOSE only if the telemetry facts ({', '.join(TELEMETRY_FACT_IDS)}) show the workload needs more\n"
+                 f"   {ctx['resource']}; cite at least one of them. Prefer the smallest value that fits.\n"
+                 f"2. If the evidence suggests a leak or does not show a capacity problem, DECLINE.")
     skeleton = json.dumps({
         "fact_ids": ["F3"], "runbook_ids": [ctx["runbook_id"]], "rationale": "two short sentences",
         "decision": "PROPOSE or DECLINE", "new_value": "one MENU value or NONE",
@@ -680,7 +781,7 @@ def _build_prompt(ctx: dict) -> str:
 change. Nothing is applied, committed or deployed, and a human reviews the result later.
 
 TASK: The diagnosis recommends {ctx['action']} for container "{ctx['container']}". Choose ONE value
-from MENU for its {ctx['resource']} limit, or DECLINE.
+from MENU for its {ctx['field_label']}, or DECLINE.
 
 FACTS (from the incident and the manifest; cite by id):
 {facts}
@@ -691,12 +792,10 @@ NOTE: {ctx['rule_note']}
 GUIDANCE (official documentation, {ctx['runbook_source']}; runbook_id {ctx['runbook_id']}):
 {guidance}
 
-MENU for the {ctx['resource']} limit: {', '.join(ctx['candidates'])}
+MENU for the {ctx['field_label']}: {', '.join(ctx['candidates'])}
 
 RULES:
-1. PROPOSE only if the telemetry facts ({', '.join(TELEMETRY_FACT_IDS)}) show the workload needs more
-   {ctx['resource']}; cite at least one of them. Prefer the smallest value that fits.
-2. If the evidence suggests a leak or does not show a capacity problem, DECLINE.
+{rules}
 3. Use only numbers that appear in FACTS or MENU. Do not claim that anything happened before.
    Write the rationale in plain ASCII text.
 4. Reply with one JSON object only, for example: {skeleton}
@@ -819,12 +918,12 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
         if g["routing"]["mode"] == AUTOMATIC_AI else
         f"confidence {g['parsed'].confidence:.4f} < {CONFIDENCE_FLOOR:.2f}: human approval recorded"))
     resource = spec["resource"]
-    field_path = ("resources", "limits", resource)
+    flag_action = action == FLAG_ACTION
 
     # V1-V5: target and configuration gates (before any LLM call).
     rel = _gate(steps, "path_syntax", lambda: validate_repo_relative_path(_rel_target(cfg, env)))
     rec["target_file"] = rel
-    file_spec, _ = _gate(steps, "path_allowlist", lambda: allowlisted_field(rel, action))
+    file_spec, field_path = _gate(steps, "path_allowlist", lambda: allowlisted_field(rel, action))
     read = _gate(steps, "path_containment", lambda: read_allowlisted_file(repo_root, rel))
     rec["base"] = read.base_record()
 
@@ -854,6 +953,12 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
             raise PatchDiffError("UNSUPPORTED_MANIFEST", "metadata.namespace must be a plain string")
         _assert_finite_numbers(doc)
         span = locate_container_scalar(read.text_lf, field_path)
+        if flag_action:
+            if span["value"] == "false":
+                raise PatchDiffError("AT_BOUND", f"{FEATURE_FLAG} is already \"false\" in the manifest")
+            if span["value"] != "true" or span["style"] not in ('"', "'"):
+                raise PatchDiffError("UNSUPPORTED_MANIFEST", f"{FEATURE_FLAG} must be the quoted string \"true\"")
+            return doc, span, None
         try:
             request_span = locate_container_scalar(read.text_lf, ("resources", "requests", resource))
         except PatchDiffError as exc:
@@ -914,6 +1019,13 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
                 raise ProposalStop(NOT_GENERATED, "REPO_MISMATCH",
                                    "configured GitHub repo is not this checkout's origin")
             configured = wanted
+        if flag_action:
+            live = g["flag"]
+            if (live["namespace"], live["deployment"], live["container"]) != (namespace, name, cname):
+                raise ProposalStop(NOT_GENERATED, "TARGET_MISMATCH",
+                                   "the container Kubernetes reported is not the manifest's Deployment/container")
+            return {"configured_repo": configured, "local_origin": local, "effective": None,
+                    "utilisation": None, "candidates": ["false"], "rule_value": None}
         raw_factor = cfg.get("max_resource_scale_factor")
         try:
             factor = POLICY_MAX_FACTOR if raw_factor is None else float(raw_factor)
@@ -939,8 +1051,20 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
             min_utilisation = _at_least(settings.min_utilisation, POLICY_MIN_UTILISATION)
             if g["crash_loop"]:
                 min_utilisation = max(min_utilisation, CRASH_LOOP_MIN_UTILISATION)
+            if g["cpu_down"]:
+                starved = g["starved"]
+                if (starved["namespace"], starved["deployment"], starved["container"]) != (namespace, name, cname):
+                    raise ProposalStop(NOT_GENERATED, "TARGET_MISMATCH",
+                                       "the pod that is not ready is not the manifest's Deployment/container")
+                if starved["live_cpu_limit"] != span["value"]:
+                    raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
+                                       f"the pod ran with CPU limit {starved['live_cpu_limit']}, "
+                                       f"the manifest says {span['value']}")
+                min_utilisation = max(min_utilisation, CPU_STARVED_MIN_UTILISATION)
             if not (_is_real(utilisation) and utilisation >= min_utilisation):
                 why = "; a crash loop counts as memory pressure only at the limit" if g["crash_loop"] else ""
+                if g["cpu_down"]:
+                    why = "; a down target counts as CPU starvation only near the limit"
                 raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
                                    f"peak is {utilisation:.0%} of the limit (< {min_utilisation:.0%}){why}")
             if not utilisation <= MAX_PLAUSIBLE_UTILISATION:
@@ -959,6 +1083,8 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
             # Never offer a value that Stage 4 verification would certainly reject: the measured
             # peak must stay below VERIFY_HEADROOM of the new limit.
             values = [v for v in values if peak_amount / spec["parse"](v) < VERIFY_HEADROOM]
+            if SATURATED_BAND[0] <= utilisation <= SATURATED_BAND[1] or g["cpu_down"]:
+                values = values[-1:]   # pinned at the limit: real demand unknown, largest bounded value only
         if not values:
             raise ProposalStop(NOT_GENERATED, "AT_BOUND", "no allowed value above the current limit")
         return {"configured_repo": configured, "local_origin": local, "effective": effective,
@@ -968,13 +1094,14 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
     rec["target_ref"] = {
         "api_version": doc.get("apiVersion"), "kind": doc.get("kind"), "name": name,
         "namespace": namespace, "container": cname,
-        "field_path": f"spec.template.spec.containers[0].resources.limits.{resource}",
+        "field_path": (f"spec.template.spec.containers[0].env[name={FEATURE_FLAG}].value" if flag_action
+                       else f"spec.template.spec.containers[0].resources.limits.{resource}"),
         "line": span["line"], "column": span["column"],
     }
     rec["candidates"] = {
         "values": ic["candidates"], "effective_factor": ic["effective"],
-        "hard_cap": HARD_CAPS[resource], "current_value": span["value"], "request_value": request,
-        "rule_engine_patch_value": ic["rule_value"],
+        "hard_cap": None if flag_action else HARD_CAPS[resource], "current_value": span["value"],
+        "request_value": request, "rule_engine_patch_value": ic["rule_value"],
     }
 
     # Facts and guidance offered to the LLM (code-derived only).
@@ -983,7 +1110,23 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
     alert_name = _plain_label(alert.get("name")) or "(withheld)"
     severity = _plain_label(alert.get("severity")) or "unknown"
     facts = [{"id": "F1", "source": "alert", "text": f"alert {alert_name}, severity {severity}"}]
-    if g["evidence_mode"] == "oom_killed":
+    if g["evidence_mode"] == "leak":
+        live = g["flag"]
+        facts += [
+            {"id": "F2", "source": "telemetry", "text": "telemetry was collected for this incident"},
+            {"id": "F3", "source": "telemetry",
+             "text": f"memory was still growing {g['growth']:.1f} MiB/min when the incident was built"},
+            {"id": "F4", "source": "kubernetes",
+             "text": f"the live container {cname} runs with {FEATURE_FLAG}=\"true\" (the response cache is on)"},
+        ]
+        if live["restart_count"]:
+            facts.append({"id": "K1", "source": "kubernetes",
+                          "text": f"container {cname} restarted {live['restart_count']} times; last termination "
+                                  f"{live['last_termination_reason'] or 'unknown'}"})
+        rec["review_notes"].append("evidence: memory measured still growing while the feature is on; turning the "
+                                   "feature off is the only value offered (a larger limit would only delay the "
+                                   "next OOM kill)")
+    elif g["evidence_mode"] == "oom_killed":
         oom = g["oom"]
         state = oom["waiting_reason"] or "Running"
         exit_code = oom["exit_code"] if isinstance(oom["exit_code"], int) else "unknown"
@@ -1013,7 +1156,16 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
                                   f"{exit_code} ({r['reason'] or 'unknown'}); state {r['waiting_reason'] or 'Running'}"})
             rec["review_notes"].append("evidence: repeated restarts with memory measured at the limit; values "
                                        "that cannot leave 20% headroom were removed from the menu")
-    facts.append({"id": "M1", "source": "manifest", "text": f"current {resource} limit {span['value']}"})
+        if g["cpu_down"]:
+            s = g["starved"]
+            facts.append({"id": "K1", "source": "kubernetes",
+                          "text": f"{s['pods']} pod(s) running but not ready: {s['readiness_failures']} readiness "
+                                  f"probe failures, no restarts, no OOMKilled"})
+            rec["review_notes"].append("evidence: the target is out of service while running (readiness probe "
+                                       "failures) with CPU measured near its limit; throttling hides the real "
+                                       "demand, so only the largest bounded value is offered")
+    field_label = f"{FEATURE_FLAG} feature flag" if flag_action else f"{resource} limit"
+    facts.append({"id": "M1", "source": "manifest", "text": f"current {field_label} {span['value']}"})
     if request:
         facts.append({"id": "M2", "source": "manifest", "text": f"current {resource} request {request}"})
     facts.append({"id": "D1", "source": "diagnosis",
@@ -1024,7 +1176,8 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
     rule_note = (f"rule-engine category label {g['rule_class']} is a static rule keyed on the alert name; "
                  f"it is not evidence of a leak" if g["rule_class"] else "no rule-engine label")
     ctx = {
-        "action": action, "container": cname, "resource": resource, "facts": facts, "guidance": guidance,
+        "action": action, "container": cname, "resource": resource, "field_label": field_label,
+        "flag": flag_action, "facts": facts, "guidance": guidance,
         "diagnosis": _one_line(g["parsed"].root_cause_analysis, 300), "rule_note": rule_note,
         "runbook_id": runbook["runbook_id"],
         "runbook_source": f"{runbook['source_organization']} - {runbook['source_title']}",
@@ -1045,7 +1198,8 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
     grounded_numbers = _numbers("\n".join(f["text"] for f in facts if f["id"] != "F1") + " "
                                 + " ".join(ic["candidates"]) + " " + " ".join(guidance))
     info = rec["model_info"]
-    info.update({"prompt_version": PROMPT_VERSION, "prompt_sha256": _sha256_text(prompt),
+    info.update({"prompt_version": FLAG_PROMPT_VERSION if flag_action else PROMPT_VERSION,
+                 "prompt_sha256": _sha256_text(prompt),
                  "prompt_chars": len(prompt)})
 
     # The single LLM call: choose a value or decline.
@@ -1137,10 +1291,14 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
     # V6-V13: validate the code-built edit and diff as untrusted input.
     deadline = _Deadline(settings.validation_timeout_s, monotonic)
     new_value = d["new_value"]
-    old_amount, new_amount = spec["parse"](span["value"]), spec["parse"](new_value)
     before_lf = read.text_lf
 
     def bounds():
+        if flag_action:   # a feature flag may only be turned off
+            if (span["value"], new_value) != ("true", "false") or new_value not in ic["candidates"]:
+                raise ProposalStop(REJECTED, "BOUNDS_VIOLATION", f"{new_value} is outside the allowed bounds")
+            return
+        old_amount, new_amount = spec["parse"](span["value"]), spec["parse"](new_value)
         cap = spec["parse"](HARD_CAPS[resource])
         req = spec["parse"](request) if request else 0
         if not (new_amount > old_amount and new_amount <= int(old_amount * ic["effective"])
@@ -1172,7 +1330,7 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
 
     def diff_policy():
         parsed = parse_unified_diff_strict(diff_text, rel)
-        check_diff_policy(parsed, before_lf.split("\n"), span["line"], resource)
+        check_diff_policy(parsed, before_lf.split("\n"), span["line"], field_path[-1])
 
     def sandbox():
         result = sandbox_apply(rel, before_lf, diff_text, after_lf, repo_root)
@@ -1191,7 +1349,12 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
                 "diff_sha256": _sha256_text(diff_text), "bytes": len(diff_text.encode("utf-8")), "valid": False}
         raise
     before_doc = yaml.safe_load(before_lf)
-    expected_path = f"spec.template.spec.containers.[0].resources.limits.{resource}"
+    if flag_action:
+        env_list = before_doc["spec"]["template"]["spec"]["containers"][0].get("env") or []
+        at = next(i for i, e in enumerate(env_list) if isinstance(e, dict) and e.get("name") == FEATURE_FLAG)
+        expected_path = f"spec.template.spec.containers.[0].env.[{at}].value"
+    else:
+        expected_path = f"spec.template.spec.containers.[0].resources.limits.{resource}"
 
     def post_apply_yaml():
         try:
@@ -1206,6 +1369,8 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
         changed = changed_paths(before_doc, after_doc)
         if not same_identity or changed != {expected_path}:
             raise ProposalStop(REJECTED, "OUT_OF_SCOPE_CHANGE", f"changed paths: {sorted(changed)[:5]}")
+        if flag_action:
+            return after_doc
         res = after_doc["spec"]["template"]["spec"]["containers"][0].get("resources") or {}
         new_limit = spec["parse"](str((res.get("limits") or {}).get(resource)))
         req = (res.get("requests") or {}).get(resource)
@@ -1217,9 +1382,11 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
     after_doc = _gate(steps, "post_apply_yaml", post_apply_yaml, REJECTED)
 
     def oracle():
-        generator = PatchGenerator(max_scale_factor=ic["effective"])
-        patched, previous = generator.generate({"type": action, "patch_value": new_value}, before_doc)
-        expected_prev = {f"{resource}_limit_{cname}": span["value"]}
+        generator = PatchGenerator(max_scale_factor=ic["effective"] or POLICY_MAX_FACTOR)
+        patched, previous = generator.generate({"type": action, "patch_value": new_value, "flag": FEATURE_FLAG},
+                                               before_doc)
+        expected_prev = ({f"env_{cname}_{FEATURE_FLAG}": span["value"]} if flag_action
+                         else {f"{resource}_limit_{cname}": span["value"]})
         if patched != after_doc or previous != expected_prev:
             raise ProposalStop(REJECTED, "CROSS_CHECK_MISMATCH", "PatchGenerator disagrees with the edit")
         if generator.apply_rollback(after_doc, previous) != before_doc:
