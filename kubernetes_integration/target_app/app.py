@@ -32,6 +32,22 @@ if not os.path.exists("/proc/self/stat"):   # not Linux: the built-in collector 
 data = []
 cpu_stress_flag = False
 
+# Crash-loop chaos (Kubernetes demo): memory the app needs at start-up, e.g. a cache it
+# loads before serving. Set through the optional ConfigMap "target-app-chaos" (see
+# engine/k8s_chaos.py). Above the container memory limit, every start is OOMKilled and
+# Kubernetes reports CrashLoopBackOff, in every new pod, until the limit is raised.
+STARTUP_MEMORY_MB = int(os.getenv("STARTUP_MEMORY_MB", "0") or 0)
+startup_cache = b""
+
+
+@app.on_event("startup")
+def load_startup_cache():
+    global startup_cache
+    if STARTUP_MEMORY_MB > 0:
+        print(f"[target-app] loading start-up cache: {STARTUP_MEMORY_MB} MB", flush=True)
+        startup_cache = b"\x01" * (STARTUP_MEMORY_MB * 1024 * 1024)   # written, so really resident
+        print("[target-app] start-up cache loaded", flush=True)
+
 @app.get("/health")
 def health():
     return {"status": "ok"}

@@ -129,6 +129,12 @@ MANDATORY_CHECKS = (
     "post_apply_yaml", "patchgenerator_oracle", "eol_variant", "real_tree_untouched",
 )
 POLICY_MIN_UTILISATION = 0.80
+# Crash loop caused by the memory limit: Kubernetes must report the target container's last
+# termination as OOMKilled at least this many restarts in a row (code-collected, never LLM text).
+OOM_MIN_RESTARTS = 2
+# A container OOMKilled at limit L needs more than L, so a new limit N leaves it above L/N of N.
+# Verification requires usage below 80% of the new limit, which N = 1.25 x L can never satisfy.
+OOM_MIN_FACTOR = 1.25
 POLICY_MAX_FACTOR = 2.0
 MAX_PLAUSIBLE_UTILISATION = 1.5   # a peak far above the limit means the manifest is not what ran
 EXIT_INTERRUPTED = 130
@@ -325,6 +331,25 @@ def _field(container: dict, key: str, kind, where: str):
     return value
 
 
+def _oom_evidence(raw_context) -> Optional[dict]:
+    """Kubernetes evidence (collected by engine/k8s_evidence.py, not by the LLM) that the target
+    container is crash-looping because it is OOMKilled at its memory limit, or None."""
+    k8s = (raw_context or {}).get("kubernetes") if isinstance(raw_context, dict) else None
+    if not isinstance(k8s, dict) or k8s.get("available") is not True:
+        return None
+    s = k8s.get("summary")
+    if not isinstance(s, dict) or s.get("last_termination_reason") != "OOMKilled":
+        return None
+    restarts = s.get("restart_count")
+    if not isinstance(restarts, int) or isinstance(restarts, bool) or restarts < OOM_MIN_RESTARTS:
+        return None
+    fields = {key: s.get(key) for key in ("namespace", "deployment", "container", "live_memory_limit")}
+    if not all(_plain_label(v) for v in fields.values()):
+        return None
+    return {**fields, "restart_count": restarts, "exit_code": s.get("last_exit_code"),
+            "waiting_reason": _plain_label(s.get("waiting_reason")) if s.get("waiting_reason") else None}
+
+
 def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=None) -> dict:
     if system_mode == "DISABLED":
         raise ProposalStop(NOT_GENERATED, "SYSTEM_DISABLED", "kill switch is DISABLED")
@@ -363,9 +388,14 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
     if spec is None:
         raise ProposalStop(NOT_GENERATED, "UNSUPPORTED_ACTION", f"{action} is not supported in Stage 2")
     rule_class = rule_engine.get("root_cause_classification")
-    if parsed.incident_type != spec["incident_type"] or rule_class == spec["conflicting_rule"]:
-        raise ProposalStop(NOT_GENERATED, "INCONSISTENT_DIAGNOSIS",
-                           f"{action} conflicts with incident_type {parsed.incident_type} / rule {_plain_label(rule_class)}")
+    oom = _oom_evidence(raw_context) if action == "INCREASE_MEMORY_LIMIT" else None
+    # A crash loop is only a memory problem when Kubernetes says the container was OOMKilled.
+    crash_loop_oom = parsed.incident_type == "CRASH_LOOP" and oom is not None
+    if (parsed.incident_type != spec["incident_type"] and not crash_loop_oom) or rule_class == spec["conflicting_rule"]:
+        detail = f"{action} conflicts with incident_type {parsed.incident_type} / rule {_plain_label(rule_class)}"
+        if parsed.incident_type == "CRASH_LOOP" and action == "INCREASE_MEMORY_LIMIT":
+            detail += "; a crash loop needs Kubernetes evidence of repeated OOMKilled terminations"
+        raise ProposalStop(NOT_GENERATED, "INCONSISTENT_DIAGNOSIS", detail)
     # The one routing threshold, never the (validated, but possibly forced) settings value.
     min_confidence = CONFIDENCE_FLOOR
     if not _is_real(parsed.confidence):
@@ -384,14 +414,25 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
         routing = {"mode": HUMAN_APPROVED, "approval_required": True,
                    "decision_id": approval["decision_id"], "decided_at": approval.get("decided_at")}
 
-    if telemetry.get("available") is not True:
-        raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE", "no telemetry was collected")
-    peak = summary.get(spec["peak_key"])
-    if not (_is_real(peak) and peak > 0):
-        raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE", f"no positive {spec['resource']} peak")
-    if raw_tel.get(f"{spec['resource']}_available") is False:
-        raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
-                           f"raw context says {spec['resource']} telemetry was unavailable")
+    def telemetry_problem():
+        if telemetry.get("available") is not True:
+            return "no telemetry was collected"
+        value = summary.get(spec["peak_key"])
+        if not (_is_real(value) and value > 0):
+            return f"no positive {spec['resource']} peak"
+        if raw_tel.get(f"{spec['resource']}_available") is False:
+            return f"raw context says {spec['resource']} telemetry was unavailable"
+        return None
+
+    # Evidence: either measured usage near the limit, or (memory only) repeated OOMKilled
+    # terminations reported by Kubernetes. A crash-looping container has no meaningful usage.
+    problem = telemetry_problem()
+    if crash_loop_oom or (problem and oom is not None):
+        evidence_mode, peak = "oom_killed", None
+    elif problem:
+        raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE", problem)
+    else:
+        evidence_mode, peak = "utilisation", float(summary.get(spec["peak_key"]))
 
     retrieved = {h.get("runbook_id") for h in retrieved_hits if isinstance(h, dict)}
     runbook = next((d for d in load_runbooks() if d["runbook_id"] == spec["runbook"]), None)
@@ -401,7 +442,8 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
         raise ProposalStop(NOT_GENERATED, "NO_SUPPORTING_RUNBOOK",
                            f"official runbook {spec['runbook']} was not retrieved for this incident")
     return {"report": report, "parsed": parsed, "action": action, "spec": spec,
-            "peak": float(peak), "runbook": runbook, "labels": labels, "alert": alert,
+            "peak": peak, "evidence_mode": evidence_mode, "oom": oom,
+            "runbook": runbook, "labels": labels, "alert": alert,
             "rule_action": rule_action, "routing": routing,
             "rule_class": _plain_label(rule_class) or ("(withheld)" if rule_class else None)}
 
@@ -840,15 +882,26 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
         if not math.isfinite(effective) or effective <= 1.0:
             raise ProposalStop(NOT_GENERATED, "CONFIG_INVALID", f"effective scale factor {effective} <= 1.0")
         limit_amount = spec["parse"](span["value"])
-        peak_amount = g["peak"] * (1000.0 if resource == "cpu" else 1.0)
-        utilisation = peak_amount / limit_amount
-        min_utilisation = _at_least(settings.min_utilisation, POLICY_MIN_UTILISATION)
-        if not (_is_real(utilisation) and utilisation >= min_utilisation):
-            raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
-                               f"peak is {utilisation:.0%} of the limit (< {min_utilisation:.0%})")
-        if not utilisation <= MAX_PLAUSIBLE_UTILISATION:
-            raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
-                               f"peak is {utilisation:.0%} of the limit; telemetry does not match this manifest")
+        if g["evidence_mode"] == "oom_killed":
+            oom = g["oom"]
+            if (oom["namespace"], oom["deployment"], oom["container"]) != (namespace, name, cname):
+                raise ProposalStop(NOT_GENERATED, "TARGET_MISMATCH",
+                                   "the OOMKilled container is not the manifest's Deployment/container")
+            if oom["live_memory_limit"] != span["value"]:
+                raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
+                                   f"the OOMKilled container ran with limit {oom['live_memory_limit']}, "
+                                   f"the manifest says {span['value']}")
+            utilisation = None
+        else:
+            peak_amount = g["peak"] * (1000.0 if resource == "cpu" else 1.0)
+            utilisation = peak_amount / limit_amount
+            min_utilisation = _at_least(settings.min_utilisation, POLICY_MIN_UTILISATION)
+            if not (_is_real(utilisation) and utilisation >= min_utilisation):
+                raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
+                                   f"peak is {utilisation:.0%} of the limit (< {min_utilisation:.0%})")
+            if not utilisation <= MAX_PLAUSIBLE_UTILISATION:
+                raise ProposalStop(NOT_GENERATED, "INSUFFICIENT_EVIDENCE",
+                                   f"peak is {utilisation:.0%} of the limit; telemetry does not match this manifest")
         rule_action = g["rule_action"]
         rule_value = rule_action.get("patch_value") if rule_action.get("type") == action else None
         if not isinstance(rule_value, str):
@@ -856,6 +909,8 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
         values = candidate_values(spec, span["value"], request, effective, rule_value)
         if span["style"] is None:   # plain scalar: keep only values that still load as the same string
             values = [v for v in values if yaml.safe_load(v) == v]
+        if g["evidence_mode"] == "oom_killed":
+            values = [v for v in values if spec["parse"](v) > limit_amount * OOM_MIN_FACTOR]
         if not values:
             raise ProposalStop(NOT_GENERATED, "AT_BOUND", "no allowed value above the current limit")
         return {"configured_repo": configured, "local_origin": local, "effective": effective,
@@ -876,17 +931,33 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
 
     # Facts and guidance offered to the LLM (code-derived only).
     peak = g["peak"]
-    peak_text = f"{peak / _MIB:.1f}Mi" if resource == "memory" else f"{peak * 1000:.0f}m"
     alert = g["alert"]
     alert_name = _plain_label(alert.get("name")) or "(withheld)"
     severity = _plain_label(alert.get("severity")) or "unknown"
-    facts = [
-        {"id": "F1", "source": "alert", "text": f"alert {alert_name}, severity {severity}"},
-        {"id": "F2", "source": "telemetry", "text": "telemetry was collected for this incident"},
-        {"id": "F3", "source": "telemetry", "text": f"{resource} peak {peak_text}"},
-        {"id": "F4", "source": "code", "text": f"peak is {ic['utilisation'] * 100:.0f}% of the current {resource} limit"},
-        {"id": "M1", "source": "manifest", "text": f"current {resource} limit {span['value']}"},
-    ]
+    facts = [{"id": "F1", "source": "alert", "text": f"alert {alert_name}, severity {severity}"}]
+    if g["evidence_mode"] == "oom_killed":
+        oom = g["oom"]
+        state = oom["waiting_reason"] or "Running"
+        exit_code = oom["exit_code"] if isinstance(oom["exit_code"], int) else "unknown"
+        facts += [
+            {"id": "F2", "source": "kubernetes", "text": "Kubernetes pod status was collected for this incident"},
+            {"id": "F3", "source": "kubernetes",
+             "text": f"container {cname} was OOMKilled (exit code {exit_code}); {oom['restart_count']} restarts; "
+                     f"current state {state}"},
+            {"id": "F4", "source": "code",
+             "text": f"the container was killed at the current {resource} limit {span['value']}, "
+                     f"so it needs more than {span['value']} to start"},
+        ]
+        rec["review_notes"].append("evidence: repeated OOMKilled terminations (no usage measurement); "
+                                   "values that cannot leave 20% headroom were removed from the menu")
+    else:
+        peak_text = f"{peak / _MIB:.1f}Mi" if resource == "memory" else f"{peak * 1000:.0f}m"
+        facts += [
+            {"id": "F2", "source": "telemetry", "text": "telemetry was collected for this incident"},
+            {"id": "F3", "source": "telemetry", "text": f"{resource} peak {peak_text}"},
+            {"id": "F4", "source": "code", "text": f"peak is {ic['utilisation'] * 100:.0f}% of the current {resource} limit"},
+        ]
+    facts.append({"id": "M1", "source": "manifest", "text": f"current {resource} limit {span['value']}"})
     if request:
         facts.append({"id": "M2", "source": "manifest", "text": f"current {resource} request {request}"})
     facts.append({"id": "D1", "source": "diagnosis",

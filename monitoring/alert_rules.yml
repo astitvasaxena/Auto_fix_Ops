@@ -64,9 +64,8 @@ groups:
         annotations:
           summary: "Target app is crash-looping (process restarted)"
           description: >
-            The target-app process has restarted
-            {{ $value }} time(s) in the last 5 minutes.
-            This indicates a crash loop or forced restart.
+            The target-app process has restarted repeatedly.
+            This indicates a crash loop or forced restarts.
 
       # ── Target Completely Down ───────────────────────────────
       # Fires if the scrape target is totally unreachable for 30s.
@@ -81,5 +80,6 @@ groups:
         annotations:
           summary: "Target app is completely unreachable"
           description: >
-            The target-app scrape target has been unreachable for >30 seconds.
-            Prometheus scrape failures indicate the application is down.
+            The target-app scrape target is unreachable: Prometheus scrape
+            failures indicate the application is down or not ready (for example
+            a container that keeps crashing).

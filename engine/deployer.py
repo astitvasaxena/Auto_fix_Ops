@@ -32,6 +32,7 @@ from engine.policy import RESTRICTED_NAMESPACES
 _K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _CONTEXT = re.compile(r"^[A-Za-z0-9._@:/-]{1,128}$")
 _QUANTITY = re.compile(r"^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|K|M|G)?$")
+_POD_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 _FIELD_PATH = re.compile(r"^spec\.template\.spec\.containers\[\d+\]\.resources\.limits\.(memory|cpu)$")
 MAX_OUTPUT = 2000
 
@@ -78,6 +79,13 @@ def deploy_config(env=None) -> DeployConfig:
         raise DeployBlocked("DEPLOY_DISABLED", "automated deployment is off (set DEPLOY_MODE=kubectl to enable)")
     if mode != "kubectl":
         raise DeployBlocked("DEPLOY_CONFIG_INVALID", f"unknown DEPLOY_MODE {mode!r}")
+    return read_config(env)
+
+
+def read_config(env=None) -> DeployConfig:
+    """Cluster settings for READ-ONLY use (evidence collection): the same explicit context and
+    target allowlist as deployment, but valid while deployment itself is disabled."""
+    env = os.environ if env is None else env
     context = (env.get("DEPLOY_KUBE_CONTEXT") or "").strip()
     if not _CONTEXT.match(context):
         raise DeployBlocked("DEPLOY_CONFIG_INVALID", "DEPLOY_KUBE_CONTEXT must name the kubectl context explicitly")
@@ -192,6 +200,24 @@ class Kubectl:
         timeout = self.cfg.rollout_timeout_s
         return self._run(t.namespace, ["rollout", "status", f"deployment/{t.name}", f"--timeout={timeout}s"],
                          timeout=timeout + 15)
+
+    def get_events(self, namespace: str) -> list:
+        """Warning events in the namespace (read-only)."""
+        r = self._run(namespace, ["get", "events", "--field-selector", "type=Warning", "--output", "json"])
+        if r.returncode != 0:
+            raise DeployBlocked("CLUSTER_UNREACHABLE", (r.stderr or "kubectl get events failed").strip()[:300])
+        try:
+            return json.loads(r.stdout).get("items", [])
+        except (ValueError, AttributeError):
+            raise DeployBlocked("CLUSTER_UNREACHABLE", "kubectl returned invalid JSON for events")
+
+    def get_logs(self, namespace: str, pod: str, container: str, previous: bool, tail: int = 20) -> str:
+        """Last log lines of one container (read-only). Empty string when none are available."""
+        if not (_POD_NAME.match(pod) and _K8S_NAME.match(container)):
+            raise DeployBlocked("TARGET_INVALID", "pod or container name is not a plain Kubernetes name")
+        args = ["logs", pod, "--container", container, f"--tail={int(tail)}"]
+        r = self._run(namespace, args + (["--previous"] if previous else []))
+        return r.stdout if r.returncode == 0 else ""
 
     def get_pods(self, t: Target, selector: Dict[str, str]) -> list:
         if not selector or not all(re.match(r"^[A-Za-z0-9._/-]{1,253}$", f"{k}{v}") for k, v in selector.items()):

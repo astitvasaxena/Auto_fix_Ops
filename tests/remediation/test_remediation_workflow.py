@@ -52,6 +52,7 @@ class FakeGitHub:
         self.commits = {"c0": {base.REL: manifest}}
         self.heads = {"main": "c0"}
         self.prs, self.calls = [], []
+        self.ci = [{"name": "CI", "status": "completed", "conclusion": "success", "url": "https://github.test/run/1"}]
 
     def _commit(self, branch, files):
         sha = f"c{len(self.commits)}"
@@ -91,6 +92,9 @@ class FakeGitHub:
               "merge_commit_sha": None, "title": title, "body": body}
         self.prs.append(pr)
         return dict(pr)
+
+    def ci_runs(self, head_sha):
+        return [dict(r) for r in self.ci]
 
     def get_pr(self, number):
         return dict(self.prs[number - 1])
@@ -433,6 +437,44 @@ def test_merged_content_must_equal_the_approved_patch():
     view = w.advance(run["id"])
     assert view["stage"] == wf.FAILED and w.kube.argvs == []
     print("✅ PASS: a PR edited before merge is never deployed")
+
+
+def test_ci_must_pass_on_the_pr_before_deployment():
+    w = World()
+    w.github.ci = [{"name": "CI", "status": "in_progress", "conclusion": None, "url": "u"}]
+    run, _ = w.approve()
+    w.advance(run["id"])
+    w.github.merge(1)
+    view = w.advance(run["id"])
+    assert view["stage"] == wf.PR_OPEN and view["blocked_code"] == "CI_PENDING" and w.kube.argvs == []
+    assert view["github"]["ci_status"] == "pending"
+    w.github.ci = [{"name": "CI", "status": "completed", "conclusion": "failure", "url": "u"}]
+    view = w.advance(run["id"])
+    assert view["stage"] == wf.FAILED and w.kube.argvs == [] and w.incident().status == IncidentStatus.FAILED
+    assert any(e["event"] == "CI_FAILED" for e in view["audit_log"])
+
+    w2 = World()
+    run2, _ = w2.approve()
+    w2.advance(run2["id"])
+    w2.github.merge(1)
+    view = w2.advance(run2["id"])
+    assert view["stage"] == wf.READY_TO_DEPLOY and view["github"]["ci_status"] == "success"
+    assert wf.ci_summary([]) == "pending"
+    print("✅ PASS: merged PRs deploy only after GitHub Actions succeeded on the PR commit")
+
+
+def test_worker_without_credentials_keeps_polling():
+    w = World()
+    run, _ = w.approve()
+    w.advance(run["id"])
+    gh, w.github = w.github, None
+    w.scheduled.clear()
+    view = w.advance(run["id"])
+    assert view["stage"] == wf.PR_OPEN and view["blocked_code"] == "GITHUB_NOT_CONFIGURED" and w.scheduled
+    w.github = gh
+    gh.merge(1)
+    assert w.advance(run["id"])["stage"] == wf.READY_TO_DEPLOY
+    print("✅ PASS: a worker without the token blocks, keeps polling, and the run resumes")
 
 
 def test_pr_closed_or_base_changed_fails_safely():

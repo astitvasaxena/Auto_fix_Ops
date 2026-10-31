@@ -27,6 +27,10 @@ spec:
         imagePullPolicy: Never # Good for local minikube building
         ports:
         - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: target-app-chaos   # crash-loop chaos switch (STARTUP_MEMORY_MB); optional
+            optional: true
         resources:
           requests:
             memory: "64Mi"

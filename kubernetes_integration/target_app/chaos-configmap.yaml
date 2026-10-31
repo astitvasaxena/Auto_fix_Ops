@@ -1,0 +1,12 @@
+# Crash-loop chaos switch for the Kubernetes demo (see engine/k8s_chaos.py).
+# STARTUP_MEMORY_MB = memory the target app allocates at start-up. 0 = off.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: target-app-chaos
+  namespace: autofixops
+  labels:
+    app: target-app
+    system: autofixops
+data:
+  STARTUP_MEMORY_MB: "0"

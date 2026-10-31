@@ -8,6 +8,8 @@ default) so AutoFixOps can deploy an approved remediation and verify recovery.
   python scripts/k8s_demo.py status    [--context docker-desktop]
   python scripts/k8s_demo.py teardown  [--context docker-desktop]
   python scripts/k8s_demo.py target local|k8s   # which target Prometheus scrapes
+  python scripts/k8s_demo.py chaos crashloop    # start-up needs > memory limit: OOMKilled loop
+  python scripts/k8s_demo.py chaos reset        # remove the chaos requirement (manual recovery)
 
 setup:    builds autofixops/target-app:latest, applies the namespace, the
           repository's deployment.yaml (memory limit 100Mi) and a NodePort
@@ -71,7 +73,7 @@ def set_target(where):
 def setup(context):
     check_context(context)
     run(["docker", "build", "-t", IMAGE, str(APP_DIR)])
-    for name in ("namespace.yaml", "deployment.yaml", "service-nodeport.yaml"):
+    for name in ("namespace.yaml", "chaos-configmap.yaml", "deployment.yaml", "service-nodeport.yaml"):
         kubectl(context, "apply", "-f", str(APP_DIR / name))
     kubectl(context, "--namespace", NAMESPACE, "rollout", "status", f"deployment/{DEPLOYMENT}", "--timeout=180s")
     for _ in range(30):
@@ -102,16 +104,48 @@ def teardown(context):
     set_target("local")
 
 
+def _baseline_rss() -> float:
+    """Current resident memory of the healthy target pod, read from its /metrics."""
+    with urllib.request.urlopen(f"http://localhost:{NODE_PORT}/metrics", timeout=5) as resp:
+        for line in resp.read().decode("utf-8", "replace").splitlines():
+            if line.startswith("process_resident_memory_bytes "):
+                return float(line.split()[1])
+    sys.exit("process_resident_memory_bytes not found on the target's /metrics")
+
+
+def chaos(context, action):
+    check_context(context)
+    sys.path.insert(0, str(REPO))
+    from engine import deployer as dep
+    from engine import k8s_chaos
+
+    cfg = dep.read_config({"DEPLOY_KUBE_CONTEXT": context, "DEPLOY_ALLOWED_TARGETS": f"{NAMESPACE}/{DEPLOYMENT}"})
+    target = dep.Target(NAMESPACE, DEPLOYMENT, "target-app", "memory", "0", "0")
+    try:
+        if action == "crashloop":
+            result = k8s_chaos.inject_crash_loop(cfg, target, _baseline_rss())
+        else:
+            result = k8s_chaos.reset(cfg, target)
+    except dep.DeployBlocked as exc:
+        sys.exit(f"{exc.code}: {exc.detail}")
+    print(json.dumps(result, indent=2))
+    print(f"watch: kubectl --context {context} -n {NAMESPACE} get pods -w")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["setup", "status", "teardown", "target"])
-    parser.add_argument("where", nargs="?", choices=["local", "k8s"])
+    parser.add_argument("command", choices=["setup", "status", "teardown", "target", "chaos"])
+    parser.add_argument("where", nargs="?", choices=["local", "k8s", "crashloop", "reset"])
     parser.add_argument("--context", default="docker-desktop")
     args = parser.parse_args()
     if args.command == "target":
-        if not args.where:
+        if args.where not in ("local", "k8s"):
             parser.error("target needs 'local' or 'k8s'")
         set_target(args.where)
+    elif args.command == "chaos":
+        if args.where not in ("crashloop", "reset"):
+            parser.error("chaos needs 'crashloop' or 'reset'")
+        chaos(args.context, args.where)
     else:
         {"setup": setup, "status": status, "teardown": teardown}[args.command](args.context)
 

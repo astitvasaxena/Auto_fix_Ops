@@ -58,6 +58,7 @@ env:
     tests/ai/test_telemetry.py
     tests/test_pre_diagnosis_context_flow.py
     tests/remediation/test_remediation_workflow.py
+    tests/remediation/test_crash_loop.py
     tests/rag/test_runbooks.py
     tests/safety_drills/test_bad_diagnosis.py
     tests/safety_drills/test_bad_patch.py

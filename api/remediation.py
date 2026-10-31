@@ -161,3 +161,81 @@ def close_incident(incident_id: uuid.UUID, body: ReasonIn, actor=Depends(require
     except wf.WorkflowError as exc:
         raise _http(exc)
     return {**result, "view": _view(session_factory, incident_id)}
+
+
+# ─── Kubernetes target status and crash-loop chaos (local demo) ───
+
+class K8sChaosIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fault: str = Field(pattern=r"^(crash_loop|reset)$")
+    confirmation: str
+
+
+def _k8s_target():
+    from engine import deployer as dep
+    from engine.telemetry import DEFAULT_WORKLOAD
+
+    cfg = dep.read_config()
+    workload = os.getenv("TARGET_WORKLOAD", DEFAULT_WORKLOAD)
+    namespace = os.getenv("TARGET_NAMESPACE", "autofixops")
+    if f"{namespace}/{workload}" not in cfg.allowed_targets:
+        raise dep.DeployBlocked("TARGET_NOT_ALLOWLISTED", f"{namespace}/{workload} is not in DEPLOY_ALLOWED_TARGETS")
+    return cfg, dep.Target(namespace, workload, "target-app", "memory", "0", "0")
+
+
+@router.get("/target/kubernetes")
+def kubernetes_target_status():
+    """Live pod health of the Kubernetes target (read-only kubectl) and the chaos switch."""
+    from engine import deployer as dep
+    from engine import k8s_chaos, k8s_evidence
+
+    evidence = k8s_evidence.collect({"namespace": os.getenv("TARGET_NAMESPACE", "autofixops")})
+    chaos = None
+    if evidence.get("available"):
+        try:
+            cfg, target = _k8s_target()
+            chaos = k8s_chaos.status(cfg, target)
+        except dep.DeployBlocked as exc:
+            chaos = {"error": f"{exc.code}: {exc.detail}"}
+    return {"evidence": evidence, "chaos": chaos,
+            "chaos_enabled": os.getenv("CHAOS_K8S_ENABLED", "false").strip().lower() == "true"}
+
+
+@router.post("/chaos/kubernetes", dependencies=[Depends(require_json)])
+def kubernetes_chaos(body: K8sChaosIn, actor=Depends(require_approver)):
+    """Crash-loop chaos on the allowlisted Kubernetes target. Opt-in (CHAOS_K8S_ENABLED=true).
+    It never creates an incident: detection must come from Prometheus/Alertmanager."""
+    import requests
+
+    from api.config_helpers import is_system_disabled
+    from engine import deployer as dep
+    from engine import k8s_chaos
+    from engine.telemetry import DEFAULT_SCRAPE_JOB
+
+    if os.getenv("CHAOS_K8S_ENABLED", "false").strip().lower() != "true":
+        raise HTTPException(status_code=403, detail="CHAOS_DISABLED: set CHAOS_K8S_ENABLED=true to allow Kubernetes chaos")
+    if body.confirmation != "CONFIRM":
+        raise HTTPException(status_code=400, detail="Must type CONFIRM to inject chaos.")
+    if is_system_disabled():
+        raise HTTPException(status_code=503, detail="System is DISABLED. Chaos injection blocked.")
+    try:
+        cfg, target = _k8s_target()
+        if body.fault == "reset":
+            result = k8s_chaos.reset(cfg, target)
+        else:
+            baseline = 50 * 1024 * 1024   # used only if Prometheus has no current reading
+            try:
+                job = os.getenv("TARGET_SCRAPE_JOB", DEFAULT_SCRAPE_JOB)
+                resp = requests.get(f"{os.getenv('PROMETHEUS_URL', 'http://localhost:9090')}/api/v1/query",
+                                    params={"query": f'process_resident_memory_bytes{{job="{job}"}}'}, timeout=5)
+                values = resp.json().get("data", {}).get("result", [])
+                if values:
+                    baseline = float(values[0]["value"][1])
+            except Exception:
+                pass
+            result = k8s_chaos.inject_crash_loop(cfg, target, baseline)
+    except dep.DeployBlocked as exc:
+        raise HTTPException(status_code=409, detail=f"{exc.code}: {exc.detail}")
+    logger.info(f"[CHAOS] Kubernetes {body.fault}: {result} (by {actor.get('identity') or actor.get('client_host')})")
+    return {**result, "incident_created": False,
+            "note": "No incident is created here; Prometheus/Alertmanager must detect the failure."}

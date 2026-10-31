@@ -45,6 +45,7 @@ from engine.remediation import RemediationEngine
 from engine.verification import VerificationEngine
 from engine.target_resolver import TargetResolver, TargetResolutionError
 from engine.telemetry import collect_telemetry
+from engine.k8s_evidence import collect as collect_k8s_evidence
 from engine import debug_trace as _dt
 
 
@@ -184,6 +185,15 @@ def build_incident_context(self, incident_id: str):
             lambda q: fetch_prometheus_metric(q, prometheus_url),
             incident.raw_payload_cache.get("labels", {}),
         )
+        kubernetes = collect_k8s_evidence(incident.raw_payload_cache.get("labels", {}))
+        if kubernetes.get("available"):
+            k8s_summary = kubernetes["summary"]
+            logger.info(
+                f"[TRACE:{incident_id}] Kubernetes: restarts={k8s_summary['restart_count']} "
+                f"waiting={k8s_summary['waiting_reason']} last={k8s_summary['last_termination_reason']}"
+            )
+        else:
+            logger.info(f"[TRACE:{incident_id}] Kubernetes evidence unavailable: {kubernetes.get('reason')}")
         cpu_data = telemetry["metrics"]["cpu"]
         mem_data = telemetry["metrics"]["memory"]
         logger.info(
@@ -225,6 +235,8 @@ def build_incident_context(self, incident_id: str):
                 "units": telemetry["units"],
                 "queries": telemetry["queries"],
             },
+            # Read-only pod status, events and crashed-container logs (code-collected).
+            "kubernetes": kubernetes,
             # Compatibility with existing ContextSummarizer & MongoDB consumers
             "metrics": {"cpu": cpu_data, "memory": mem_data},
             "target_pod": pod_name,

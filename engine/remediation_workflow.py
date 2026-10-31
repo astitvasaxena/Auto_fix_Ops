@@ -532,14 +532,41 @@ def _pr_poll_s(deps) -> int:
         return 30
 
 
+_CI_OK = {"success", "skipped", "neutral"}
+
+
+def ci_summary(runs: list) -> str:
+    """success | failure | pending for the GitHub Actions runs of one commit."""
+    if not runs:
+        return "pending"
+    if any(r.get("status") == "completed" and r.get("conclusion") not in _CI_OK for r in runs):
+        return "failure"
+    if all(r.get("status") == "completed" for r in runs):
+        return "success"
+    return "pending"
+
+
 def _check_pr(session_factory, run, proposal, snap, deps, token, now) -> Outcome:
     gateway, _ = deps.github()
-    if gateway is None:
-        return Outcome(blocked=("GITHUB_NOT_CONFIGURED", "GitHub credentials are no longer configured"))
+    if gateway is None:   # e.g. a worker started without the token: keep checking, change nothing
+        return Outcome(blocked=("GITHUB_NOT_CONFIGURED", "GitHub credentials are not configured in this worker"),
+                       next_in=_pr_poll_s(deps))
     github = dict(run.github or {})
+    require_ci = _flag(deps.env, "REMEDIATION_REQUIRE_CI", "true")
     try:
         pr = gateway.get_pr(github["pr_number"])
         github.update(pr_state=pr["state"], merged=pr["merged"], last_checked_at=_iso(now))
+        runs = gateway.ci_runs(pr["head_sha"]) if require_ci else []
+        github.update(ci_required=require_ci, ci_status=ci_summary(runs) if require_ci else "not required",
+                      ci_runs=[{k: r.get(k) for k in ("name", "status", "conclusion", "url")} for r in runs][:10],
+                      ci_head_sha=pr["head_sha"])
+        if pr["merged"] and require_ci and github["ci_status"] != "success":
+            if github["ci_status"] == "failure":
+                return Outcome(stage=FAILED, updates={"github": github}, incident=("FAILED",),
+                               events=[_event("CI_FAILED", now, head_sha=pr["head_sha"])],
+                               note="the PR was merged but GitHub Actions failed on it; not deployed")
+            return Outcome(updates={"github": github}, next_in=_pr_poll_s(deps),
+                           blocked=("CI_PENDING", "merged; waiting for GitHub Actions to finish on the PR commit"))
         if pr["merged"]:
             content, _ = gateway.get_file(proposal.target_file, pr["merge_commit_sha"])
             if git_blob_sha(content.replace(b"\r\n", b"\n")) != proposal.patched_git_blob_sha:

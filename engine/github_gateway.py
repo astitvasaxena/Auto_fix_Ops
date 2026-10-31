@@ -97,6 +97,13 @@ class PyGithubGateway:
                         lambda: self.repo.create_pull(title=title, body=body, head=head, base=base, draft=draft))
         return _pr_dict(pr)
 
+    def ci_runs(self, head_sha: str) -> list:
+        """GitHub Actions runs for a commit (needs Actions: read)."""
+        runs = self._call(f"list workflow runs for {head_sha[:7]}",
+                          lambda: list(self.repo.get_workflow_runs(head_sha=head_sha)))
+        return [{"name": r.name, "event": r.event, "status": r.status, "conclusion": r.conclusion,
+                 "url": r.html_url} for r in runs]
+
     def get_pr(self, number: int) -> dict:
         return _pr_dict(self._call(f"read pull request #{number}", lambda: self.repo.get_pull(number)))
 
