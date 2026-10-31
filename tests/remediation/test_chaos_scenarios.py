@@ -118,22 +118,21 @@ def test_cpu_work_backlog_grows_only_when_cpu_is_short_and_fails_readiness():
     app = _load_app()
     samples = {}
 
-    def run(millicores, seconds, hog):
+    def run(millicores, seconds, cpu_share):
+        # cpu_share < 1 models a CPU limit (as a cgroup quota would): only that share of the thread's
+        # real CPU time counts as work done, so the work needs proportionally more CPU than it gets.
         stop = time.time() + seconds
-        worker = threading.Thread(target=app._process_work, args=(millicores, stop), daemon=True)
-        hogger = threading.Thread(target=lambda: [None for _ in iter(lambda: time.time() < stop, False)], daemon=True)
+        clock = (lambda: time.thread_time() * cpu_share) if cpu_share < 1 else time.thread_time
+        worker = threading.Thread(target=app._process_work, args=(millicores, stop),
+                                  kwargs={"cpu_clock": clock}, daemon=True)
         worker.start()
-        if hog:
-            hogger.start()   # a second CPU-bound thread: the worker gets about half of one core
         time.sleep(seconds - 0.25)
         backlog = app.work["backlog_s"]
         worker.join(2)
-        if hog:
-            hogger.join(2)
         return backlog
 
-    samples["enough_cpu"] = run(300, 1.2, hog=False)
-    samples["starved"] = run(900, 1.6, hog=True)
+    samples["enough_cpu"] = run(300, 1.2, cpu_share=1)
+    samples["starved"] = run(900, 1.6, cpu_share=0.5)    # 900m of work, half a core: backlog ~0.4s/s
     assert samples["enough_cpu"] < 0.15, samples
     assert samples["starved"] > 0.25, samples
     assert app.work["backlog_s"] == 0.0                                  # stops (and clears) at its expiry

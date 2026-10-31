@@ -131,18 +131,19 @@ def _leak_forever(mb_per_min, expires_at):
         time.sleep(pause)
 
 
-def _process_work(millicores, expires_at, chunk=0.01):
+def _process_work(millicores, expires_at, chunk=0.01, cpu_clock=time.thread_time):
     """Work arrives at `millicores` of CPU time per second and this thread processes it. The backlog
     is the CPU time that has arrived but not been spent yet, in seconds of arrivals: it stays near
-    zero while the CPU limit leaves room for the work and grows without end when it does not."""
+    zero while the CPU limit leaves room for the work and grows without end when it does not.
+    cpu_clock is this thread's CPU time (replaceable in tests to model a CPU limit)."""
     rate = millicores / 1000.0
-    start, cpu_start = time.monotonic(), time.thread_time()
+    start, cpu_start = time.monotonic(), cpu_clock()
     while time.time() < expires_at:
-        backlog = rate * (time.monotonic() - start) - (time.thread_time() - cpu_start)
+        backlog = rate * (time.monotonic() - start) - (cpu_clock() - cpu_start)
         work["backlog_s"] = max(0.0, backlog) / rate
         if backlog > 0:
-            until = time.thread_time() + chunk
-            while time.thread_time() < until:
+            until = cpu_clock() + chunk
+            while cpu_clock() < until:
                 pass
         else:
             time.sleep(chunk)
