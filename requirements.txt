@@ -15,6 +15,7 @@ sentence-transformers>=2.2.2
 PyGithub>=2.1.1
 PyYAML>=6.0.1
 psutil>=5.9.0
+prometheus-client>=0.21.1   # the target app (kubernetes_integration/target_app) runs from this environment
 httpx>=0.25.0
 python-dotenv>=1.0.0
 certifi>=2023.0.0
