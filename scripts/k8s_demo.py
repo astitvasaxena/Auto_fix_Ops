@@ -58,8 +58,36 @@ def check_context(context):
                  "Enable it first, e.g. Docker Desktop > Settings > Kubernetes > Enable Kubernetes.")
 
 
-def set_target(where):
-    address = f"host.docker.internal:{NODE_PORT}" if where == "k8s" else "host.docker.internal:8001"
+def node_address(context="docker-desktop"):
+    """Where Prometheus (a docker-compose container) reaches the NodePort.
+
+    Docker Desktop's kind-based cluster does not publish NodePorts on the host, so Prometheus is
+    attached to the `kind` Docker network and scrapes the node's internal IP. Otherwise the
+    NodePort is on the host (host.docker.internal)."""
+    nets = run(["docker", "network", "ls", "--format", "{{.Name}}"], capture=True).stdout.split()
+    if "kind" not in nets:
+        return f"host.docker.internal:{NODE_PORT}"
+    inspect = run(["docker", "inspect", "autofixops-prometheus", "--format", "{{json .NetworkSettings.Networks}}"],
+                  capture=True, check=False).stdout
+    if '"kind"' not in inspect:
+        run(["docker", "network", "connect", "kind", "autofixops-prometheus"])
+    ip = kubectl(context, "get", "nodes", "-o", "jsonpath={.items[0].status.addresses[?(@.type=='InternalIP')].address}",
+                 capture=True).stdout.split()
+    ipv4 = next((a for a in ip if a.count(".") == 3), None)   # the node may also report an IPv6 address
+    if not ipv4:
+        sys.exit(f"no IPv4 InternalIP for the node: {ip}")
+    return f"{ipv4}:{NODE_PORT}"
+
+
+def proxy_get(context, path):
+    """GET the target through the API server's service proxy (works without a published NodePort)."""
+    out = kubectl(context, "--namespace", NAMESPACE, "get", "--raw",
+                  f"/api/v1/namespaces/{NAMESPACE}/services/target-app-nodeport:80/proxy{path}", check=False, capture=True)
+    return out.stdout if out.returncode == 0 else None
+
+
+def set_target(where, context="docker-desktop"):
+    address = node_address(context) if where == "k8s" else "host.docker.internal:8001"
     entry = [{"targets": [address], "labels": {"environment": "kubernetes" if where == "k8s" else "local",
                                                "app": "target-app", "service": "target-app"}}]
     TARGETS_FILE.write_text(json.dumps(entry, indent=2) + "\n", encoding="utf-8")
@@ -77,16 +105,14 @@ def setup(context):
         kubectl(context, "apply", "-f", str(APP_DIR / name))
     kubectl(context, "--namespace", NAMESPACE, "rollout", "status", f"deployment/{DEPLOYMENT}", "--timeout=180s")
     for _ in range(30):
-        try:
-            with urllib.request.urlopen(f"http://localhost:{NODE_PORT}/health", timeout=3) as resp:
-                if resp.status == 200:
-                    break
-        except Exception:
-            time.sleep(2)
+        if proxy_get(context, "/health"):
+            break
+        time.sleep(2)
     else:
-        sys.exit(f"target did not answer on http://localhost:{NODE_PORT}/health")
-    set_target("k8s")
-    print(f"\nReady. Target app: http://localhost:{NODE_PORT}  (stop the local process on :8001 to avoid confusion)")
+        sys.exit("target did not answer /health through the API server proxy")
+    set_target("k8s", context)
+    print("\nReady. Health: kube-service://autofixops/target-app-nodeport:80/health "
+          "(stop the local process on :8001 to avoid confusion)")
 
 
 def status(context):
@@ -104,13 +130,12 @@ def teardown(context):
     set_target("local")
 
 
-def _baseline_rss() -> float:
+def _baseline_rss(context) -> float:
     """Current resident memory of the healthy target pod, read from its /metrics."""
-    with urllib.request.urlopen(f"http://localhost:{NODE_PORT}/metrics", timeout=5) as resp:
-        for line in resp.read().decode("utf-8", "replace").splitlines():
-            if line.startswith("process_resident_memory_bytes "):
-                return float(line.split()[1])
-    sys.exit("process_resident_memory_bytes not found on the target's /metrics")
+    for line in (proxy_get(context, "/metrics") or "").splitlines():
+        if line.startswith("process_resident_memory_bytes "):
+            return float(line.split()[1])
+    sys.exit("process_resident_memory_bytes not found on the target's /metrics (is the pod healthy?)")
 
 
 def chaos(context, action):
@@ -123,7 +148,7 @@ def chaos(context, action):
     target = dep.Target(NAMESPACE, DEPLOYMENT, "target-app", "memory", "0", "0")
     try:
         if action == "crashloop":
-            result = k8s_chaos.inject_crash_loop(cfg, target, _baseline_rss())
+            result = k8s_chaos.inject_crash_loop(cfg, target, _baseline_rss(context))
         else:
             result = k8s_chaos.reset(cfg, target)
     except dep.DeployBlocked as exc:
@@ -141,7 +166,7 @@ def main():
     if args.command == "target":
         if args.where not in ("local", "k8s"):
             parser.error("target needs 'local' or 'k8s'")
-        set_target(args.where)
+        set_target(args.where, args.context)
     elif args.command == "chaos":
         if args.where not in ("crashloop", "reset"):
             parser.error("chaos needs 'crashloop' or 'reset'")

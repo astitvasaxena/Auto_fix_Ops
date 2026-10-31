@@ -32,6 +32,7 @@ from engine.policy import RESTRICTED_NAMESPACES
 _K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _CONTEXT = re.compile(r"^[A-Za-z0-9._@:/-]{1,128}$")
 _QUANTITY = re.compile(r"^[0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|K|M|G)?$")
+_SERVICE_PROXY = re.compile(r"^/api/v1/namespaces/[a-z0-9-]{1,63}/services/[a-z0-9-]{1,63}:[0-9]{1,5}/proxy/[A-Za-z0-9._/-]{0,200}$")
 _POD_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
 _FIELD_PATH = re.compile(r"^spec\.template\.spec\.containers\[\d+\]\.resources\.limits\.(memory|cpu)$")
 MAX_OUTPUT = 2000
@@ -200,6 +201,12 @@ class Kubectl:
         timeout = self.cfg.rollout_timeout_s
         return self._run(t.namespace, ["rollout", "status", f"deployment/{t.name}", f"--timeout={timeout}s"],
                          timeout=timeout + 15)
+
+    def get_raw(self, namespace: str, path: str) -> CommandResult:
+        """GET through the API server's service proxy (read-only), e.g. a health endpoint."""
+        if not _SERVICE_PROXY.match(path):
+            raise DeployBlocked("TARGET_INVALID", "only service-proxy paths may be read")
+        return self._run(namespace, ["get", "--raw", path])
 
     def get_events(self, namespace: str) -> list:
         """Warning events in the namespace (read-only)."""

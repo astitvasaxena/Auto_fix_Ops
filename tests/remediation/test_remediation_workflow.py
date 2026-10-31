@@ -164,6 +164,9 @@ class FakeKube:
                 trial["status"]["observedGeneration"] = trial["metadata"]["generation"]
                 self.applied.append(ops)
             return dep.CommandResult(0, "deployment.apps/autofixops-target-app patched", "")
+        if verb[:2] == ["get", "--raw"]:
+            assert verb[2] == "/api/v1/namespaces/autofixops/services/target-app-nodeport:80/proxy/health", verb
+            return dep.CommandResult(0, '{"status":"ok"}', "") if self.healthy else dep.CommandResult(1, "", "503")
         if verb[:2] == ["rollout", "status"]:
             if self.rollout_ok:
                 return dep.CommandResult(0, 'deployment "autofixops-target-app" successfully rolled out', "")
@@ -437,6 +440,23 @@ def test_merged_content_must_equal_the_approved_patch():
     view = w.advance(run["id"])
     assert view["stage"] == wf.FAILED and w.kube.argvs == []
     print("✅ PASS: a PR edited before merge is never deployed")
+
+
+def test_health_through_the_api_server_service_proxy():
+    w = World(env={"VERIFY_HEALTH_URL": "kube-service://autofixops/target-app-nodeport:80/health"}, health=500)
+    run_id = w.to_verifying()
+    for _ in range(4):
+        w.clock.tick(10)
+        view = w.advance(run_id)
+    assert view["stage"] == wf.RESOLVED, view["stage"]      # http_get (500) was not used
+    checks = {c["name"]: c for c in view["verification"]["rounds"][-1]["checks"]}
+    assert checks["app_health"]["ok"] and "kube-service://" in checks["app_health"]["detail"]
+    try:
+        dep.Kubectl(dep.read_config(ENV), w.kube).get_raw("autofixops", "/api/v1/namespaces/autofixops/pods")
+        raise AssertionError("non-proxy path allowed")
+    except dep.DeployBlocked as exc:
+        assert exc.code == "TARGET_INVALID"
+    print("✅ PASS: health via kube-service:// uses the API server service proxy; other raw paths refused")
 
 
 def test_ci_must_pass_on_the_pr_before_deployment():
