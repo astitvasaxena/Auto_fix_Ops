@@ -9,8 +9,8 @@ default) so AutoFixOps can deploy an approved remediation and verify recovery.
   python scripts/k8s_demo.py teardown  [--context docker-desktop]
   python scripts/k8s_demo.py target local|k8s   # which target Prometheus scrapes
   python scripts/k8s_demo.py chaos crashloop    # start-up needs > memory limit: OOMKilled loop
-  python scripts/k8s_demo.py chaos memoryleak   # memory keeps growing until OOMKilled, again after restarts
-  python scripts/k8s_demo.py chaos cpuspike     # CPU demand above the CPU limit: pinned and throttled
+  python scripts/k8s_demo.py chaos memoryleak   # response cache leaks until OOMKilled, again after restarts
+  python scripts/k8s_demo.py chaos cpuspike     # work above the CPU limit: backlog, readiness fails, 0/1 Ready
   python scripts/k8s_demo.py chaos reset        # clear every fault (manual recovery)
 
 setup:    builds autofixops/target-app:latest, applies the namespace, the

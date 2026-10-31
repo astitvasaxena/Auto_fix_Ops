@@ -13,12 +13,18 @@ expiry time (CHAOS_TTL_MINUTES, default 30) or when it is reset.
                RSS is not enough: part of RSS is evictable file-backed pages,
                and the container would thrash instead of being killed.)
                Fixed by a larger memory limit.
-  memory_leak  LEAK_MB_PER_MIN: memory keeps growing while the app runs until
-               it is OOMKilled, and again after every restart. A larger limit
-               only delays the next kill, so AutoFixOps escalates it instead.
-  cpu_spike    CPU_DEMAND_MILLICORES = 140% of the CPU limit (one thread, at
-               most 1000m): the container is pinned at its limit and throttled.
-               Fixed by a larger CPU limit.
+  memory_leak  LEAK_MB_PER_MIN: the app's response cache stops evicting and
+               grows until the container is OOMKilled, again after every
+               restart. A larger limit only delays the next kill; the fix is to
+               turn the cache off with the version-controlled feature flag
+               RESPONSE_CACHE_ENABLED in deployment.yaml (DISABLE_FEATURE_FLAG).
+               Needs that flag set to "true" on the live Deployment.
+  cpu_spike    CPU_DEMAND_MILLICORES = 130% of the CPU limit: background work
+               that one thread cannot finish under the limit. Its backlog grows,
+               the readiness probe (/ready) fails and the pod leaves service:
+               Running, 0/1 Ready, no restarts. Fixed by a larger CPU limit (2x
+               leaves the work at 65% of it). Needs the /ready readiness probe and
+               a demand of at most 1000m (one thread), so a CPU limit <= 769m.
 
 The only cluster writes are: patch keys of that one ConfigMap, and delete the
 target's pods. Both are limited to the allowlisted namespace/deployment.
@@ -30,6 +36,7 @@ import os
 import time
 
 from engine import deployer as dep
+from engine.patch_safety import FEATURE_FLAG
 
 CONFIGMAP = "target-app-chaos"
 KEYS = ("STARTUP_MEMORY_MB", "LEAK_MB_PER_MIN", "CPU_DEMAND_MILLICORES")
@@ -37,7 +44,9 @@ KEY = "STARTUP_MEMORY_MB"              # kept for callers of the crash-loop-only
 FAULTS = ("crash_loop", "memory_leak", "cpu_spike")
 CACHE_SHARE_OF_LIMIT = 1.0            # the start-up cache alone fills the limit -> OOMKilled every time
 LEAK_MB_PER_MIN = 40                  # +80 MB in 2 minutes: the TargetAppMemoryLeak rule fires
-CPU_DEMAND_SHARE_OF_LIMIT = 1.4       # 700m demand for a 500m limit; a 2x limit leaves it at 70%
+CPU_DEMAND_SHARE_OF_LIMIT = 1.3       # 650m of work for a 500m limit; a 2x limit leaves it at 65%
+MAX_CPU_DEMAND_MILLICORES = 1000      # one thread
+READY_PATH = "/ready"
 _MIB = 1024 * 1024
 
 
@@ -85,6 +94,11 @@ def _restart_pods(kube: dep.Kubectl, target: dep.Target, live: dict):
         raise dep.DeployBlocked("CHAOS_FAILED", (r.stderr or "pod delete failed").strip()[:300])
 
 
+def _readiness_path(live: dict, index: int):
+    probe = live["spec"]["template"]["spec"]["containers"][index].get("readinessProbe") or {}
+    return (probe.get("httpGet") or {}).get("path")
+
+
 def status(cfg: dep.DeployConfig, target: dep.Target, runner=dep.subprocess_runner, now=None) -> dict:
     now = time.time() if now is None else now
     kube = dep.Kubectl(cfg, runner)
@@ -100,7 +114,8 @@ def status(cfg: dep.DeployConfig, target: dep.Target, runner=dep.subprocess_runn
             "expires_at": expires or None, "seconds_left": max(0, int(expires - now)) if active else 0,
             "startup_memory_mb": int(faults["crash_loop"]), "leak_mb_per_min": int(faults["memory_leak"]),
             "cpu_demand_millicores": int(faults["cpu_spike"]),
-            "memory_limit": dep.live_limit(live, index, "memory"), "cpu_limit": dep.live_limit(live, index, "cpu")}
+            "memory_limit": dep.live_limit(live, index, "memory"), "cpu_limit": dep.live_limit(live, index, "cpu"),
+            "feature_flags": dep.live_flags(live, index), "readiness_path": _readiness_path(live, index)}
 
 
 def inject(cfg: dep.DeployConfig, target: dep.Target, fault: str, runner=dep.subprocess_runner,
@@ -122,15 +137,29 @@ def inject(cfg: dep.DeployConfig, target: dep.Target, fault: str, runner=dep.sub
         expected = (f"start-up needs {values['STARTUP_MEMORY_MB']}Mi + the interpreter > memory limit {memory}: "
                     f"OOMKilled at every start -> CrashLoopBackOff")
     elif fault == "memory_leak":
+        flag = dep.live_flags(live, index).get(FEATURE_FLAG)
+        if flag != "true":
+            raise dep.DeployBlocked("CHAOS_INVALID", (
+                f"the leak is in the response cache, which is off ({FEATURE_FLAG}={flag!r}); re-enable it through "
+                f"a reviewed change (revert the remediation PR)" if flag == "false" else
+                f"the live Deployment does not set {FEATURE_FLAG}; apply the current deployment.yaml first"))
         values["LEAK_MB_PER_MIN"] = LEAK_MB_PER_MIN
-        expected = (f"memory grows {LEAK_MB_PER_MIN} MB/min until the {memory} limit -> OOMKilled, "
+        expected = (f"the response cache grows {LEAK_MB_PER_MIN} MB/min until the {memory} limit -> OOMKilled, "
                     f"again after every restart")
     else:
         if not cpu:
             raise dep.DeployBlocked("CHAOS_INVALID", "the target has no CPU limit to saturate")
-        values["CPU_DEMAND_MILLICORES"] = min(1000, math.ceil(CPU_DEMAND_SHARE_OF_LIMIT * parse_cpu(cpu)))
-        expected = (f"CPU demand {values['CPU_DEMAND_MILLICORES']}m > CPU limit {cpu}: "
-                    f"pinned at the limit and throttled")
+        if _readiness_path(live, index) != READY_PATH:
+            raise dep.DeployBlocked("CHAOS_INVALID", f"the live readiness probe is not {READY_PATH}; apply the "
+                                                     f"current deployment.yaml (and target image) first")
+        demand = math.ceil(CPU_DEMAND_SHARE_OF_LIMIT * parse_cpu(cpu))
+        if demand > MAX_CPU_DEMAND_MILLICORES:
+            raise dep.DeployBlocked("CHAOS_INVALID", (
+                f"CPU limit {cpu} is too high: the work runs in one thread (at most "
+                f"{MAX_CPU_DEMAND_MILLICORES}m), so it cannot exceed it; revert an earlier CPU remediation first"))
+        values["CPU_DEMAND_MILLICORES"] = demand
+        expected = (f"background work needs {demand}m > CPU limit {cpu}: its backlog grows, the readiness "
+                    f"probe fails and the pod leaves service (Running, 0/1 Ready)")
     _write(kube, target.namespace, values)
     _restart_pods(kube, target, live)
     return {"fault": fault, "expected": expected, "memory_limit": memory, "cpu_limit": cpu,

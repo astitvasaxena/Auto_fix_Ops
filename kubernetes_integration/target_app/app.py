@@ -7,6 +7,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 app = FastAPI(title="AutoFixOps Target App")
+work = {"backlog_s": 0.0}   # unprocessed background work (CPU Spike chaos), see _process_work
 
 
 class PortableProcessCollector:
@@ -63,6 +64,8 @@ class ContainerLimitCollector:
         cores = cpu_limit_cores(_read("/sys/fs/cgroup/cpu.max"))
         if cores:
             yield GaugeMetricFamily("target_app_cpu_limit_cores", "Container CPU limit in cores.", value=cores)
+        yield GaugeMetricFamily("target_app_work_backlog_seconds",
+                                "Unprocessed background work, in seconds of arrivals.", value=work["backlog_s"])
 
 
 REGISTRY.register(ContainerLimitCollector())
@@ -77,10 +80,23 @@ cpu_stress_flag = False
 # and the background ones stop at that time: a forgotten experiment ends by itself.
 #   STARTUP_MEMORY_MB      memory needed at start-up (a cache loaded before serving). Above the
 #                          memory limit every start is OOMKilled -> CrashLoopBackOff.
-#   LEAK_MB_PER_MIN        memory that keeps leaking while the app runs -> OOMKilled, again after
-#                          every restart.
-#   CPU_DEMAND_MILLICORES  CPU work the app needs continuously (one thread, at most 1000m). Above
-#                          the CPU limit the container is pinned at the limit and throttled.
+#   LEAK_MB_PER_MIN        the response cache stops evicting and grows this fast while the app runs
+#                          -> OOMKilled, again after every restart. Only while the response cache
+#                          is enabled (RESPONSE_CACHE_ENABLED, below).
+#   CPU_DEMAND_MILLICORES  background work arriving continuously, processed by one thread (at most
+#                          1000m). Above the CPU limit it cannot keep up: the backlog grows, /ready
+#                          fails and Kubernetes takes the pod out of service (Running, 0/1 Ready).
+#
+# RESPONSE_CACHE_ENABLED is a feature flag set in deployment.yaml (version-controlled, default
+# true), not by chaos. Turning the cache off is a reviewed change to the manifest that stops the
+# leak while the fault is still set.
+READY_MAX_BACKLOG_S = 15.0   # /ready fails above this much unprocessed work (seconds of arrivals)
+
+
+def response_cache_enabled():
+    return (os.getenv("RESPONSE_CACHE_ENABLED", "true") or "true").strip().lower() != "false"
+
+
 def _int_env(name):
     try:
         return max(0, int(os.getenv(name, "0") or 0))
@@ -95,16 +111,17 @@ def chaos_settings(now=None):
     except ValueError:
         expires = 0.0
     active = expires > now
-    return {"expires_at": expires, "active": active,
+    cache = response_cache_enabled()
+    return {"expires_at": expires, "active": active, "response_cache_enabled": cache,
             "startup_memory_mb": _int_env("STARTUP_MEMORY_MB") if active else 0,
-            "leak_mb_per_min": _int_env("LEAK_MB_PER_MIN") if active else 0,
+            "leak_mb_per_min": _int_env("LEAK_MB_PER_MIN") if active and cache else 0,
             "cpu_demand_millicores": min(1000, _int_env("CPU_DEMAND_MILLICORES")) if active else 0}
 
 
 CHAOS = chaos_settings()
 STARTUP_MEMORY_MB = CHAOS["startup_memory_mb"]
 startup_cache = b""
-leaked = []
+leaked = []          # response-cache entries that are never evicted
 
 
 def _leak_forever(mb_per_min, expires_at):
@@ -114,13 +131,22 @@ def _leak_forever(mb_per_min, expires_at):
         time.sleep(pause)
 
 
-def _burn_cpu(millicores, expires_at, period=0.1):
-    busy = period * millicores / 1000.0
+def _process_work(millicores, expires_at, chunk=0.01):
+    """Work arrives at `millicores` of CPU time per second and this thread processes it. The backlog
+    is the CPU time that has arrived but not been spent yet, in seconds of arrivals: it stays near
+    zero while the CPU limit leaves room for the work and grows without end when it does not."""
+    rate = millicores / 1000.0
+    start, cpu_start = time.monotonic(), time.thread_time()
     while time.time() < expires_at:
-        start = time.perf_counter()
-        while time.perf_counter() - start < busy:
-            pass
-        time.sleep(max(0.0, period - busy))
+        backlog = rate * (time.monotonic() - start) - (time.thread_time() - cpu_start)
+        work["backlog_s"] = max(0.0, backlog) / rate
+        if backlog > 0:
+            until = time.thread_time() + chunk
+            while time.thread_time() < until:
+                pass
+        else:
+            time.sleep(chunk)
+    work["backlog_s"] = 0.0
 
 
 @app.on_event("startup")
@@ -135,13 +161,26 @@ def load_startup_cache():
         threading.Thread(target=_leak_forever, args=(CHAOS["leak_mb_per_min"], CHAOS["expires_at"]),
                          daemon=True).start()
     if CHAOS["cpu_demand_millicores"] > 0:
-        print(f"[target-app] chaos: CPU demand {CHAOS['cpu_demand_millicores']}m", flush=True)
-        threading.Thread(target=_burn_cpu, args=(CHAOS["cpu_demand_millicores"], CHAOS["expires_at"]),
+        print(f"[target-app] chaos: background work needs {CHAOS['cpu_demand_millicores']}m of CPU", flush=True)
+        threading.Thread(target=_process_work, args=(CHAOS["cpu_demand_millicores"], CHAOS["expires_at"]),
                          daemon=True).start()
+
 
 @app.get("/health")
 def health():
+    """Liveness: the process is serving requests."""
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready(response: Response):
+    """Readiness: not ready while the background work is too far behind to serve traffic."""
+    backlog = round(work["backlog_s"], 1)
+    if backlog > READY_MAX_BACKLOG_S:
+        response.status_code = 503
+        print(f"[target-app] not ready: {backlog}s of background work is waiting for CPU", flush=True)
+        return {"status": "overloaded", "work_backlog_seconds": backlog}
+    return {"status": "ready", "work_backlog_seconds": backlog}
 
 
 @app.get("/metrics")
