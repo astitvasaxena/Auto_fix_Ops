@@ -1,6 +1,8 @@
 from fastapi import BackgroundTasks, FastAPI, Response
 import asyncio
 import os
+import threading
+import time
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
@@ -29,21 +31,38 @@ if not os.path.exists("/proc/self/stat"):   # not Linux: the built-in collector 
     REGISTRY.register(PortableProcessCollector())
 
 
+def _read(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def cpu_limit_cores(cpu_max):
+    """cgroup v2 cpu.max ("50000 100000" -> 0.5 cores; "max 100000" -> None)."""
+    parts = (cpu_max or "").split()
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and int(parts[1]) > 0:
+        return int(parts[0]) / int(parts[1])
+    return None
+
+
 class ContainerLimitCollector:
-    """Exports the container's memory limit (cgroup v2/v1) so alert rules can compare usage with
-    the limit that is actually in force, which changes when a remediation raises it."""
+    """Exports the container's memory and CPU limits (cgroup v2, memory also v1) so alert rules
+    compare usage with the limits actually in force, which change when a remediation raises them."""
 
     def collect(self):
         for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
-            try:
-                with open(path) as fh:
-                    value = fh.read().strip()
-            except OSError:
+            value = _read(path)
+            if value is None:
                 continue
             if value.isdigit() and int(value) < 2 ** 60:   # "max" / huge = no limit: export nothing
                 yield GaugeMetricFamily("target_app_memory_limit_bytes", "Container memory limit in bytes.",
                                         value=int(value))
-            return
+            break
+        cores = cpu_limit_cores(_read("/sys/fs/cgroup/cpu.max"))
+        if cores:
+            yield GaugeMetricFamily("target_app_cpu_limit_cores", "Container CPU limit in cores.", value=cores)
 
 
 REGISTRY.register(ContainerLimitCollector())
@@ -52,12 +71,56 @@ REGISTRY.register(ContainerLimitCollector())
 data = []
 cpu_stress_flag = False
 
-# Crash-loop chaos (Kubernetes demo): memory the app needs at start-up, e.g. a cache it
-# loads before serving. Set through the optional ConfigMap "target-app-chaos" (see
-# engine/k8s_chaos.py). Above the container memory limit, every start is OOMKilled and
-# Kubernetes reports CrashLoopBackOff, in every new pod, until the limit is raised.
-STARTUP_MEMORY_MB = int(os.getenv("STARTUP_MEMORY_MB", "0") or 0)
+# ─── Kubernetes chaos (set through the optional ConfigMap "target-app-chaos", engine/k8s_chaos.py) ───
+# Read once at start-up, so a fault persists in every new container and pod until the ConfigMap is
+# reset. Every fault is ignored unless CHAOS_EXPIRES_AT (unix time) is set and still in the future,
+# and the background ones stop at that time: a forgotten experiment ends by itself.
+#   STARTUP_MEMORY_MB      memory needed at start-up (a cache loaded before serving). Above the
+#                          memory limit every start is OOMKilled -> CrashLoopBackOff.
+#   LEAK_MB_PER_MIN        memory that keeps leaking while the app runs -> OOMKilled, again after
+#                          every restart.
+#   CPU_DEMAND_MILLICORES  CPU work the app needs continuously (one thread, at most 1000m). Above
+#                          the CPU limit the container is pinned at the limit and throttled.
+def _int_env(name):
+    try:
+        return max(0, int(os.getenv(name, "0") or 0))
+    except ValueError:
+        return 0
+
+
+def chaos_settings(now=None):
+    now = time.time() if now is None else now
+    try:
+        expires = float(os.getenv("CHAOS_EXPIRES_AT", "0") or 0)
+    except ValueError:
+        expires = 0.0
+    active = expires > now
+    return {"expires_at": expires, "active": active,
+            "startup_memory_mb": _int_env("STARTUP_MEMORY_MB") if active else 0,
+            "leak_mb_per_min": _int_env("LEAK_MB_PER_MIN") if active else 0,
+            "cpu_demand_millicores": min(1000, _int_env("CPU_DEMAND_MILLICORES")) if active else 0}
+
+
+CHAOS = chaos_settings()
+STARTUP_MEMORY_MB = CHAOS["startup_memory_mb"]
 startup_cache = b""
+leaked = []
+
+
+def _leak_forever(mb_per_min, expires_at):
+    pause = 60.0 / mb_per_min
+    while time.time() < expires_at:
+        leaked.append(b"\x01" * (1024 * 1024))   # written, so really resident
+        time.sleep(pause)
+
+
+def _burn_cpu(millicores, expires_at, period=0.1):
+    busy = period * millicores / 1000.0
+    while time.time() < expires_at:
+        start = time.perf_counter()
+        while time.perf_counter() - start < busy:
+            pass
+        time.sleep(max(0.0, period - busy))
 
 
 @app.on_event("startup")
@@ -67,6 +130,14 @@ def load_startup_cache():
         print(f"[target-app] loading start-up cache: {STARTUP_MEMORY_MB} MB", flush=True)
         startup_cache = b"\x01" * (STARTUP_MEMORY_MB * 1024 * 1024)   # written, so really resident
         print("[target-app] start-up cache loaded", flush=True)
+    if CHAOS["leak_mb_per_min"] > 0:
+        print(f"[target-app] chaos: leaking {CHAOS['leak_mb_per_min']} MB/min", flush=True)
+        threading.Thread(target=_leak_forever, args=(CHAOS["leak_mb_per_min"], CHAOS["expires_at"]),
+                         daemon=True).start()
+    if CHAOS["cpu_demand_millicores"] > 0:
+        print(f"[target-app] chaos: CPU demand {CHAOS['cpu_demand_millicores']}m", flush=True)
+        threading.Thread(target=_burn_cpu, args=(CHAOS["cpu_demand_millicores"], CHAOS["expires_at"]),
+                         daemon=True).start()
 
 @app.get("/health")
 def health():

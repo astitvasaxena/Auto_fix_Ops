@@ -232,6 +232,8 @@ def build_incident_context(self, incident_id: str):
                 "memory_available": bool(mem_data),
                 "prometheus_url": prometheus_url or "unavailable",
                 "source": telemetry["source"] or "unavailable",
+                # Memory slope at incident time (code-measured); a leak is still growing.
+                "memory_growth_mib_per_min": telemetry.get("memory_growth_mib_per_min"),
                 "units": telemetry["units"],
                 "queries": telemetry["queries"],
             },

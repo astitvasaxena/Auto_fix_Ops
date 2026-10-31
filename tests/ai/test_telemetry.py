@@ -53,6 +53,15 @@ def test_falls_back_to_process_metrics_of_the_scrape_job():
     assert summary.memory_peak == 93_000_000 and summary.cpu_peak == 0.05
 
 
+def test_memory_growth_rate_is_measured_by_code():
+    fetch = _fetch({"deriv(process_resident_memory_bytes": _vector(40 * 1024 * 1024 / 60),   # 40 MiB/min
+                    "process_resident_memory_bytes": _vector(93_000_000)})
+    t = collect_telemetry(fetch, LABELS)
+    assert t["memory_growth_mib_per_min"] == 40.0
+    assert t["queries"]["memory_growth"].startswith("deriv(process_resident_memory_bytes")
+    assert collect_telemetry(_fetch({}), LABELS)["memory_growth_mib_per_min"] is None
+
+
 def test_no_data_means_unavailable_not_invented():
     t = collect_telemetry(_fetch({}), LABELS)
     assert t["source"] is None

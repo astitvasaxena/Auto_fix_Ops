@@ -142,6 +142,13 @@ VERIFY_HEADROOM = 0.80
 # (on nodes with swap the container is not OOMKilled; it thrashes and fails its probes).
 CRASH_LOOP_MIN_UTILISATION = 1.0
 CRASH_LOOP_RUNBOOK = "k8s-repeated-container-failure"
+# Memory still growing this fast when the incident is built is a leak: a larger limit only delays the
+# next OOM kill ("the fix belongs in the application"), so no memory increase is proposed; a human decides.
+LEAK_GROWTH_MIB_PER_MIN = 5.0
+# Usage pinned at the limit (CPU throttled, memory held at the cgroup limit) hides the real demand:
+# offer only the largest bounded value, as for OOMKilled evidence. Usage measured clearly above the
+# limit (memory on a node with swap) is a real measurement and keeps the normal menu.
+SATURATED_BAND = (0.98, 1.05)
 POLICY_MAX_FACTOR = 2.0
 MAX_PLAUSIBLE_UTILISATION = 1.5   # a peak far above the limit means the manifest is not what ran
 EXIT_INTERRUPTED = 130
@@ -455,6 +462,12 @@ def _report_gates(snap: dict, settings: Settings, system_mode: str, approval=Non
         if raw_tel.get(f"{spec['resource']}_available") is False:
             return f"raw context says {spec['resource']} telemetry was unavailable"
         return None
+
+    growth = raw_tel.get("memory_growth_mib_per_min")
+    if memory_action and _is_real(growth) and growth >= LEAK_GROWTH_MIB_PER_MIN:
+        raise ProposalStop(NOT_GENERATED, "LEAK_SUSPECTED",
+                           f"memory was still growing {growth:.1f} MiB/min when the incident was built; a larger "
+                           f"limit only delays the next OOM kill, so this needs a human (application fix or rollback)")
 
     # Evidence: either measured usage near the limit, or (memory only) repeated OOMKilled
     # terminations reported by Kubernetes. A crash-looping container has no meaningful usage.
@@ -959,6 +972,8 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
             # Never offer a value that Stage 4 verification would certainly reject: the measured
             # peak must stay below VERIFY_HEADROOM of the new limit.
             values = [v for v in values if peak_amount / spec["parse"](v) < VERIFY_HEADROOM]
+            if SATURATED_BAND[0] <= utilisation <= SATURATED_BAND[1]:
+                values = values[-1:]   # pinned at the limit: real demand unknown, largest bounded value only
         if not values:
             raise ProposalStop(NOT_GENERATED, "AT_BOUND", "no allowed value above the current limit")
         return {"configured_repo": configured, "local_origin": local, "effective": effective,
