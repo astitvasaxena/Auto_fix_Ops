@@ -177,6 +177,92 @@ def test_oom_evidence_must_match_the_manifest_and_target():
     print("✅ PASS: OOM evidence for another limit, container or with malformed fields is refused")
 
 
+def _pressure_report(peak_mib):
+    report = _crash_report()
+    report["incident_context"]["telemetry"] = {"available": True, "summary": {
+        "memory_peak": peak_mib * base.MIB, "cpu_peak": 0.1, "memory_trend": "STABLE", "cpu_trend": "STABLE"}}
+    return report
+
+
+def _run_pressure(evidence, peak_mib, llm=None):
+    raw = {"labels": LABELS, "raw_context": {"telemetry": {"memory_available": True}, "kubernetes": evidence}}
+    return base.run_case(report=_pressure_report(peak_mib), raw_payload=raw, llm=llm or base.MenuStubLLM())
+
+
+def test_swap_node_crash_loop_with_memory_at_the_limit_is_remediated():
+    # On a node with swap the container is not OOMKilled: it thrashes, fails its liveness probe
+    # and is killed (exit 137, reason Error). Memory measured above the limit is the evidence.
+    ev = _evidence(reason="Error", exit_code=137, restarts=3)
+    llm = base.MenuStubLLM()
+    result, _, SF, _ = _run_pressure(ev, peak_mib=110.0, llm=llm)
+    assert result["status"] == pp.VALIDATED, (result["reason_code"], result.get("reason_detail"))
+    row = base._rows(SF)[0]
+    assert row.candidates["values"] == ["150Mi", "200Mi"]          # 125Mi: 110/125 = 88% > 80% headroom
+    facts = {f["id"]: f["text"] for f in row.evidence["facts_offered"]}
+    assert "restarted 3 times" in facts["K1"] and "137" in facts["K1"] and "110.0Mi" in facts["F3"]
+    print("✅ PASS: crash loop + repeated kills + memory measured at 110% of the limit -> VALIDATED 150Mi")
+
+
+def test_swap_node_crash_loop_below_the_limit_is_not_memory():
+    ev = _evidence(reason="Error", exit_code=137, restarts=3)
+    result, llm, _, _ = _run_pressure(ev, peak_mib=90.0)
+    assert (result["reason_code"], not llm.prompts) == ("INSUFFICIENT_EVIDENCE", True), result
+    assert "crash loop counts as memory pressure only at the limit" in result["reason_detail"]
+    ev = _evidence(reason="Error", exit_code=1, restarts=3)
+    ev["summary"]["waiting_reason"] = None                          # exit 1, not killed, not backing off
+    result, llm, _, _ = _run_pressure(ev, peak_mib=110.0)
+    assert result["reason_code"] == "INCONSISTENT_DIAGNOSIS" and not llm.prompts
+    print("✅ PASS: a crash loop below the limit, or exits that are not kills, never get a memory patch")
+
+
+def test_menu_headroom_matches_verification():
+    from engine import recovery_verifier
+    assert pp.VERIFY_HEADROOM == recovery_verifier.HEADROOM_MAX_UTILISATION
+    print("✅ PASS: proposer menu headroom equals the verification threshold")
+
+
+def test_down_and_crash_loop_alerts_share_one_incident():
+    from unittest.mock import MagicMock, patch
+
+    from fastapi.testclient import TestClient
+
+    import api.main as api_main
+    from api.database import get_db
+    from api.models import Incident
+
+    SF = base._factory()
+
+    def _get_db():
+        db = SF()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    def alert(name):
+        return {"receiver": "autofixops-webhook", "status": "firing", "externalURL": "http://am", "version": "4",
+                "groupKey": name, "alerts": [{"status": "firing", "annotations": {},
+                                              "labels": {**LABELS, "alertname": name, "severity": "critical"}}]}
+
+    api_main.app.dependency_overrides[get_db] = _get_db
+    try:
+        with patch.object(api_main, "is_system_disabled", lambda: False), \
+             patch.object(api_main, "get_default_project_id", lambda: None), \
+             patch.object(api_main, "emit_sync", lambda *a, **k: None), \
+             patch.object(api_main.build_incident_context, "apply_async", MagicMock()):
+            client = TestClient(api_main.app)
+            assert client.post("/api/v1/alerts", json=alert("TargetAppDown")).status_code == 200
+            assert client.post("/api/v1/alerts", json=alert("TargetAppCrashLoop")).status_code == 200
+            assert client.post("/api/v1/alerts", json=alert("HighMemoryUsage")).status_code == 200
+    finally:
+        api_main.app.dependency_overrides.pop(get_db, None)
+    db = SF()
+    names = sorted(i.alert_name for i in db.query(Incident).all())
+    db.close()
+    assert names == ["TargetAppDown"], names
+    print("✅ PASS: down / crash-loop / memory alerts for one target outage create one incident")
+
+
 def test_high_memory_path_is_unchanged():
     result, _, SF, _ = base.run_case()
     assert result["status"] == pp.VALIDATED and base._rows(SF)[0].candidates["values"][0] == "125Mi"

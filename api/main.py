@@ -77,6 +77,10 @@ _CLOSED_STATUSES = [
 ]
 
 
+# Alerts about the same target that describe one outage (memory pressure turning into restarts).
+_ALERT_GROUPS = (("TargetAppDown", "TargetAppCrashLoop", "TargetAppMemoryLeak", "HighMemoryUsage"),)
+
+
 def _incident_source(incident) -> str:
     """How the incident was created: "chaos_injection" (POST /chaos/inject creates it directly,
     without Prometheus/Alertmanager) or "alertmanager" (webhook from a firing alert rule)."""
@@ -140,11 +144,13 @@ async def receive_alert(
                 logger.info(f"[ALERTMANAGER RESOLVED] No active incident found for {alert_name}.")
             continue
 
-        # Prevent duplicate processing of the same active incident
+        # Prevent duplicate processing of the same active incident. Alerts in one group describe
+        # the same outage (a crash-looping target is both "down" and "restarting"): one incident.
+        same_outage = next((g for g in _ALERT_GROUPS if alert_name in g), (alert_name,))
         active_incident = (
             db.query(Incident)
             .filter(
-                Incident.alert_name == alert_name,
+                Incident.alert_name.in_(same_outage),
                 Incident.status.notin_(_CLOSED_STATUSES),
                 Incident.project_id == default_project_id,
             )

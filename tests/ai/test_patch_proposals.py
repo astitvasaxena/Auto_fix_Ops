@@ -129,16 +129,18 @@ def real_manifest_report(**overrides):
 class MenuStubLLM:
     """Like StubLLM, but proposes the first value of whatever MENU the prompt offers."""
 
-    def __init__(self):
-        self.prompts = []
+    def __init__(self, rationale="The peak is close to the current limit; a bounded increase adds headroom."):
+        self.prompts, self.menus, self.rationale = [], [], rationale
         self.runnable = RunnableLambda(self._call)
 
     def _call(self, prompt):
         text = str(prompt)
         self.prompts.append(text)
-        menu = re.search(r"MENU for the memory limit: ([^\n]+)", text).group(1)
-        first = menu.split(",")[0].strip()
-        return _decision(new_value=first, rationale="The memory peak is close to the current limit; a bounded increase adds headroom.")
+        resource, menu = re.search(r"MENU for the (memory|cpu) limit: ([^\n]+)", text).groups()
+        values = [v.strip() for v in menu.split(",")]
+        self.menus.append(values)
+        runbook = "k8s-oomkilled-memory-pressure" if resource == "memory" else "k8s-cpu-limits-throttling"
+        return _decision(new_value=values[0], runbook_ids=(runbook,), rationale=self.rationale)
 
 
 class StubLLM:
@@ -1375,7 +1377,6 @@ def test_eligibility_boundaries():
     mem = lambda peak_mib: _nested(**{"incident_context.telemetry.summary.memory_peak": peak_mib * MIB})
     cpu = lambda cores: _cpu_report(incident_context={**_report()["incident_context"], "telemetry": {
         "available": True, "summary": {"memory_peak": 1.0, "cpu_peak": cores}}})
-    cpu_llm = lambda: StubLLM(_decision(new_value="750m", runbook_ids=("k8s-cpu-limits-throttling",), rationale=quiet))
     cases = [
         ("confidence exactly 0.80", dict(report=_report(confidence=0.80)), pp.VALIDATED, None),
         ("confidence 0.7999999", dict(report=_report(confidence=0.7999999)), pp.NOT_GENERATED, "LOW_CONFIDENCE"),
@@ -1388,10 +1389,17 @@ def test_eligibility_boundaries():
         ("cpu exactly 150%", dict(report=cpu(0.75)), pp.VALIDATED, None),
         ("cpu 150.2%", dict(report=cpu(0.751)), pp.NOT_GENERATED, "INSUFFICIENT_EVIDENCE"),
     ]
+    menus = {}
     for name, kw, status, code in cases:
-        llm = cpu_llm() if "cpu" in name else StubLLM(_decision(rationale=quiet))
-        result, llm, SF, _ = run_case(llm=llm, **kw)
+        result, llm, SF, _ = run_case(llm=MenuStubLLM(rationale=quiet), **kw)
         _expect(result, SF, status, code, llm, status == pp.VALIDATED)
+        if llm.menus:
+            menus[name] = llm.menus[0]
+    # Values that Stage 4 verification would reject (peak >= 80% of the new limit) are never offered.
+    assert menus["memory exactly 80%"] == ["125Mi", "150Mi", "200Mi"], menus
+    assert menus["memory exactly 150%"] == ["200Mi"], menus
+    assert menus["cpu exactly 80%"] == ["625m", "750m", "1"], menus
+    assert menus["cpu exactly 150%"] == ["1"], menus
     print(f"✅ PASS: confidence 0.80 and utilisation 80%/150% boundaries for memory and CPU ({len(cases)} cases)")
 
 
