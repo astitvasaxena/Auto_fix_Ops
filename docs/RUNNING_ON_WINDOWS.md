@@ -136,12 +136,21 @@ Prometheus/Alertmanager do.
 | Fault | What happens in the pod | Detected by | What AutoFixOps does |
 |---|---|---|---|
 | Crash Loop (`crashloop`) | start-up needs the whole memory limit: OOMKilled at every start, CrashLoopBackOff, target down | TargetAppDown | memory limit increase (2x, the largest bounded value) after approval, PR, CI and merge; verified recovery |
-| Memory Leak (`memoryleak`) | memory grows 40 MB/min until OOMKilled, again after every restart | TargetAppMemoryLeak / HighMemoryUsage | refuses a larger limit (code-measured growth ⇒ LEAK_SUSPECTED: it would only delay the next kill) and leaves the incident to a human; recover with `chaos reset` |
-| CPU Spike (`cpuspike`) | CPU demand 140% of the CPU limit: pinned at the limit and throttled (degraded, not down) | HighCPUUsage (usage > 90% of the CPU limit for 1 min) | CPU limit increase (2x, real demand is hidden by throttling) after approval, PR, CI and merge; verified recovery |
+| Memory Leak (`memoryleak`) | the response cache stops evicting and grows 40 MB/min until OOMKilled, again after every restart (repeated outages, then CrashLoopBackOff) | TargetAppMemoryLeak / HighMemoryUsage, later TargetAppDown | never a larger limit (a leak only gets killed later); turns the feature off instead: `RESPONSE_CACHE_ENABLED` `"true"` → `"false"` in `deployment.yaml` (DISABLE_FEATURE_FLAG) after approval, PR, CI and merge; verified recovery includes memory no longer growing |
+| CPU Spike (`cpuspike`) | background work needs 130% of the CPU limit; its backlog grows, `/ready` fails and the pod leaves service: Running, 0/1 Ready, no restarts | TargetAppDown (HighCPUUsage if it is caught while still serving) | CPU limit increase (2x: throttling hides the real demand, the work then uses ~65%) after approval, PR, CI and merge; verified recovery |
 
-The CPU and leak faults, the expiry and the CPU-limit metric need the current target image and the
-HighCPUUsage rule: rebuild/import the image (see above) and reload Prometheus
-(`Invoke-WebRequest -Method Post http://localhost:9090/-/reload`).
+Each fault needs the current target image and `deployment.yaml` (readiness probe `/ready`, the
+`RESPONSE_CACHE_ENABLED` flag); injection refuses with `CHAOS_INVALID` otherwise. Order matters:
+**import the new image first, then** `kubectl --context docker-desktop apply -f kubernetes_integration/target_app/deployment.yaml`
+(an old image has no `/ready`, so the pod would never become ready). Then reload Prometheus
+(`Invoke-WebRequest -Method Post http://localhost:9090/-/reload`) and restart the API and worker.
+
+A CPU-limit or feature-flag fix is verified for at least 180 s, whatever `VERIFY_STABILIZATION_SECONDS`
+says (the timeout grows to fit): at the old values these faults take a minute or more to show again.
+A leak fix also needs memory measured flat for at least 60 s after the deployment.
+
+A merged fix stays in Git: to repeat Memory Leak or CPU Spike afterwards, revert that remediation PR
+(injection explains this if you try). Crash Loop always sizes itself to the current memory limit.
 
 A remediation whose deployment or verification fails is rolled back and the incident is
 **ESCALATED** to a human (close it with a reason on the incident page once handled).

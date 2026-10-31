@@ -68,6 +68,9 @@ export default function KubernetesTargetCard({ showChaos = true }) {
             ? <span style={{ color: 'var(--error)' }}>{data.chaos.active_faults.join(', ')} active, expires in {Math.ceil(data.chaos.seconds_left / 60)} min</span>
             : 'none active'}
           {' · '}limits <span className="mono">{data.chaos.memory_limit} / {data.chaos.cpu_limit}</span>
+          {data.chaos.feature_flags && Object.entries(data.chaos.feature_flags).map(([name, value]) => (
+            <span key={name}>{' · '}<span className="mono">{name}={value}</span></span>
+          ))}
         </p>
       )}
       {showChaos && ev?.available && (

@@ -464,7 +464,14 @@ If the deployment or the recovery verification fails, the change is rolled back
 (and a revert PR opened) and the incident becomes **ESCALATED**: a human owns it
 and can close it with a reason. Memory that is still growing when the incident
 is built (a leak) never gets a larger limit: the proposal is refused with
-`LEAK_SUSPECTED`, because a larger limit only delays the next OOM kill.
+`LEAK_SUSPECTED`, because a larger limit only delays the next OOM kill. When
+Kubernetes shows the leaking feature switched on (`RESPONSE_CACHE_ENABLED` in
+`deployment.yaml`), the proposal is instead to turn that feature off
+(`DISABLE_FEATURE_FLAG`, `"true"` → `"false"`, the only value offered), through
+the same approval, PR, CI, merge and verification; verification then also
+requires memory to stop growing. A target that is down while its pod keeps
+running but fails readiness, never restarted, with CPU measured near its limit
+is treated as CPU starvation and gets the bounded CPU limit increase.
 
 Steps that cannot run yet (no GitHub credentials, deployment disabled, shadow
 mode, target not allowlisted, cluster unreachable) show **Waiting: <reason>**
