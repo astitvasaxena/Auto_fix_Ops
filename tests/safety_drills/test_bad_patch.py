@@ -55,13 +55,19 @@ def test_patch_does_not_mutate_original():
         }
     }
     
-    patched = gen.generate({"type": "INCREASE_MEMORY_LIMIT", "patch_value": "256Mi"}, original)
+    patched, previous = gen.generate({"type": "INCREASE_MEMORY_LIMIT", "patch_value": "150Mi"}, original)
     
     # Original must be unchanged
     assert original["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"] == "100Mi", \
         "Original manifest was mutated!"
-    assert patched["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"] == "256Mi"
+    assert patched["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"] == "150Mi"
+    assert previous == {"memory_limit_app": "100Mi"}, previous   # recorded for exact rollback
     
+    # A request above the 2x safety bound is clamped, and the input is still untouched.
+    clamped, _ = gen.generate({"type": "INCREASE_MEMORY_LIMIT", "patch_value": "256Mi"}, original)
+    assert clamped["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"] == "200Mi"
+    assert original["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"] == "100Mi"
+
     print("✅ PASS: Original manifest not mutated by patch")
 
 
@@ -70,7 +76,7 @@ def test_restart_annotation_format():
     gen = PatchGenerator()
     manifest = {"spec": {"template": {"metadata": {}, "spec": {"containers": [{"name": "app"}]}}}}
     
-    patched = gen.generate({"type": "RESTART_POD"}, manifest)
+    patched, _ = gen.generate({"type": "RESTART_POD"}, manifest)
     annotation = patched["spec"]["template"]["metadata"]["annotations"].get(
         "kubectl.kubernetes.io/restartedAt", ""
     )

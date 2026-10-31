@@ -64,9 +64,6 @@ env:
     tests/safety_drills/test_failure_and_timeline.py
     tests/safety_drills/test_false_recovery.py
     tests/evaluator/test_rollback.py
-  KNOWN_FAILURES: >-
-    tests/safety_drills/test_bad_patch.py::test_patch_does_not_mutate_original
-    tests/safety_drills/test_bad_patch.py::test_restart_annotation_format
   SLOW_TESTS: >-
     tests/rag/test_runbooks.py::test_seed_script_replaces_legacy_and_is_idempotent
 
@@ -134,52 +131,10 @@ jobs:
         id: main-tests
         run: |
           deselect=()
-          for t in $KNOWN_FAILURES $SLOW_TESTS; do deselect+=(--deselect "$t"); done
+          for t in $SLOW_TESTS; do deselect+=(--deselect "$t"); done
           python -m pytest -p no:cacheprovider -ra --durations=15 \
             --junitxml="$RUNNER_TEMP/junit-main.xml" \
             $MAIN_TEST_FILES "${deselect[@]}"
-
-      - name: Check known pre-existing failures (test_bad_patch.py)
-        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: |
-          files=$(for t in $KNOWN_FAILURES; do echo "${t%%::*}"; done | sort -u)
-          set +e
-          python -m pytest -p no:cacheprovider -rA $files --junitxml="$RUNNER_TEMP/junit-known-failures.xml"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
-            echo "::error::pytest exited with $rc (collection or internal error) while checking known failures"
-            exit 1
-          fi
-          python - "$RUNNER_TEMP/junit-known-failures.xml" <<'PY'
-          import os, sys, xml.etree.ElementTree as ET
-          # Pre-existing failures recorded in the Stage 0 report. They are deselected
-          # from the main suite and checked here so they stay visible.
-          EXPECTED = set(os.environ["KNOWN_FAILURES"].split())
-          cases = list(ET.parse(sys.argv[1]).getroot().iter("testcase"))
-          node = lambda tc: tc.get("classname", "").replace(".", "/") + ".py::" + tc.get("name", "")
-          ran = {node(tc) for tc in cases}
-          failed = {node(tc) for tc in cases if tc.find("failure") is not None or tc.find("error") is not None}
-          status = lambda t: "not run" if t not in ran else ("fail" if t in failed else "pass")
-          lines = ["### Known pre-existing failures (tracked, not hidden)", "",
-                   "| Test | Expected | Actual |", "|---|---|---|"]
-          for t in sorted(EXPECTED | failed):
-              lines.append(f"| `{t}` | {'fail' if t in EXPECTED else 'pass'} | {status(t)} |")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write("\n".join(lines) + "\n")
-          for t in sorted(EXPECTED & failed):
-              print(f"::warning title=Known failing test::{t} still fails (pre-existing)")
-          errors = []
-          if EXPECTED - ran:
-              errors.append(f"Known-failure tests were not collected: {sorted(EXPECTED - ran)}")
-          if failed - EXPECTED:
-              errors.append(f"Unexpected failures: {sorted(failed - EXPECTED)}")
-          if (EXPECTED & ran) - failed:
-              errors.append(f"Known failures now pass; remove them from KNOWN_FAILURES: {sorted((EXPECTED & ran) - failed)}")
-          for e in errors:
-              print(f"::error::{e}")
-          sys.exit(1 if errors else 0)
-          PY
 
       - name: Report tests not selected by CI
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
