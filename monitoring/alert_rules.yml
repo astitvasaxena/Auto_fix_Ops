@@ -55,6 +55,27 @@ groups:
             Container target-app in pod autofixops-target-app is using most
             of its memory limit (OOMKilled risk).
 
+      # ── High CPU (relative to the CPU limit in force) ──────────
+      # Fires when the process uses more than 90% of the container CPU limit
+      # (exported by the target as target_app_cpu_limit_cores from its cgroup)
+      # for a minute: it is pinned at its limit and throttled. Without a CPU
+      # limit metric (the local Windows process) it does not fire.
+      - alert: HighCPUUsage
+        expr: >
+          rate(process_cpu_seconds_total{job="autofixops-target"}[1m])
+            / on(instance) target_app_cpu_limit_cores{job="autofixops-target"} > 0.9
+        for: 1m
+        labels:
+          severity: warning
+          namespace: autofixops
+          pod: autofixops-target-app
+          container: target-app
+        annotations:
+          summary: "High CPU usage on autofixops-target-app"
+          description: >
+            Container target-app in pod autofixops-target-app is using nearly
+            all of its CPU limit and is being throttled.
+
       # ── CrashLoop Detection (via process restart) ────────────
       # Detects repeated restarts: the process start time changed more than
       # once in the last 5 minutes. One restart (e.g. the rollout of an

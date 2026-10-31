@@ -98,6 +98,7 @@ class PatchGenerator:
             "INCREASE_CPU_LIMIT": self._patch_cpu_limit,
             "RESTART_POD": self._patch_restart_annotation,
             "ROLLBACK_DEPLOYMENT": self._patch_rollback,
+            "DISABLE_FEATURE_FLAG": self._patch_feature_flag,
         }
 
         handler = dispatch.get(action_type)
@@ -142,6 +143,12 @@ class PatchGenerator:
             img_key = f"image_{c_name}"
             if img_key in previous_values:
                 container["image"] = previous_values[img_key]
+
+            # Feature flags (env values)
+            for entry in container.get("env") or []:
+                flag_key = f"env_{c_name}_{entry.get('name')}" if isinstance(entry, dict) else None
+                if flag_key in previous_values:
+                    entry["value"] = previous_values[flag_key]
                 
         # 2. Revert restart annotation
         if "restart_annotation" in previous_values:
@@ -265,6 +272,27 @@ class PatchGenerator:
                 f"[PATCH] Container '{container.get('name')}': "
                 f"image {current_image} → {container['image']}"
             )
+
+    def _patch_feature_flag(self, manifest: Dict, action: Dict):
+        """Turns one allowlisted feature flag off: its env value "true" -> "false". Nothing else is
+        allowed: an unknown flag, another value or a manifest without the flag set to "true" is refused."""
+        from engine.patch_safety import FEATURE_FLAGS
+
+        flag = action.get("flag")
+        if flag not in FEATURE_FLAGS or action.get("patch_value") != "false":
+            raise PatchBoundsError(f"only an allowlisted feature flag can be set to \"false\" (got {flag!r})")
+        changed = 0
+        for container in self._get_containers(manifest):
+            for entry in container.get("env") or []:
+                if isinstance(entry, dict) and entry.get("name") == flag:
+                    if entry.get("value") != "true":
+                        raise PatchBoundsError(f"{flag} is {entry.get('value')!r}, not \"true\"")
+                    self.previous_values[f"env_{container.get('name', 'default')}_{flag}"] = entry["value"]
+                    entry["value"] = "false"
+                    changed += 1
+        if not changed:
+            raise PatchBoundsError(f"no container sets the feature flag {flag}")
+        logger.info(f"[PATCH] feature flag {flag}: true -> false")
 
     def _get_containers(self, manifest: Dict) -> list:
         """Extracts containers list from manifest."""

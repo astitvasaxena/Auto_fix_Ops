@@ -26,6 +26,9 @@ from typing import Callable, Dict, List, Optional
 DEFAULT_WORKLOAD = "autofixops-target-app"
 DEFAULT_SCRAPE_JOB = "autofixops-target"
 WINDOW = "5m"
+GROWTH_WINDOW = "3m"   # memory slope at incident time: a leak is still growing, a one-off step is not
+# Memory still growing at least this fast is treated as a leak (patch proposer, recovery verification).
+LEAK_GROWTH_MIB_PER_MIN = 5.0
 
 # Label values end up inside PromQL strings, so only plain Kubernetes-style
 # names are accepted (no quotes, braces or regex characters).
@@ -52,12 +55,14 @@ def telemetry_queries(labels: Dict, namespace_default: str = "autofixops",
         queries["kubernetes_cadvisor"] = {
             "memory": f"max_over_time(container_memory_working_set_bytes{{{sel}}}[{WINDOW}])",
             "cpu": f"max_over_time(rate(container_cpu_usage_seconds_total{{{sel}}}[1m])[{WINDOW}:15s])",
+            "memory_growth": f"deriv(container_memory_working_set_bytes{{{sel}}}[{GROWTH_WINDOW}])",
         }
     if job:
         sel = f'job="{job}"'
         queries["process_metrics"] = {
             "memory": f"max_over_time(process_resident_memory_bytes{{{sel}}}[{WINDOW}])",
             "cpu": f"max_over_time(rate(process_cpu_seconds_total{{{sel}}}[1m])[{WINDOW}:15s])",
+            "memory_growth": f"deriv(process_resident_memory_bytes{{{sel}}}[{GROWTH_WINDOW}])",
         }
     return queries
 
@@ -76,6 +81,19 @@ def collect_telemetry(fetch: Callable[[str], List], labels: Dict,
         memory, cpu = fetch(q["memory"]) or [], fetch(q["cpu"]) or []
         if memory or cpu:
             return {"source": source, "metrics": {"memory": memory, "cpu": cpu},
+                    "memory_growth_mib_per_min": _growth(fetch(q["memory_growth"]) or []),
                     "queries": q, "units": {"memory": "bytes", "cpu": "cores"}}
-    return {"source": None, "metrics": {"memory": [], "cpu": []},
+    return {"source": None, "metrics": {"memory": [], "cpu": []}, "memory_growth_mib_per_min": None,
             "queries": queries, "units": {"memory": "bytes", "cpu": "cores"}}
+
+
+def _growth(result) -> Optional[float]:
+    """Largest memory slope (bytes/s from deriv) as MiB per minute, or None without data."""
+    values = []
+    for series in result:
+        try:
+            values.append(float(series["value"][1]))
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    values = [v for v in values if v == v]   # drop NaN
+    return round(max(values) * 60 / (1024 * 1024), 2) if values else None

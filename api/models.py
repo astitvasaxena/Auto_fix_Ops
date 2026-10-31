@@ -14,8 +14,9 @@ VALID_TRANSITIONS = {
     "CONTEXT_BUILT":    {"DIAGNOSED", "FAILED"},
     "DIAGNOSED":        {"POLICY_APPROVED", "ESCALATED", "FAILED"},
     "POLICY_APPROVED":  {"REMEDIATING", "FAILED"},
-    "REMEDIATING":      {"PENDING_PR_MERGE", "VERIFIED", "FAILED"},  # VERIFIED: PR step skipped by config
-    "PENDING_PR_MERGE": {"VERIFIED", "FAILED"},
+    # ESCALATED: an approved remediation failed or was rolled back; a human takes over.
+    "REMEDIATING":      {"PENDING_PR_MERGE", "VERIFIED", "ESCALATED", "FAILED"},  # VERIFIED: PR step skipped
+    "PENDING_PR_MERGE": {"VERIFIED", "ESCALATED", "FAILED"},
     "VERIFIED":         {"RESOLVED", "FAILED"},
     "ESCALATED":        {"POLICY_APPROVED", "RESOLVED"},  # Human can approve or resolve
     "FAILED":           set(),          # Terminal state

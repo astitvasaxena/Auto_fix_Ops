@@ -6,7 +6,8 @@ allowlisted target only (DEPLOY_KUBE_CONTEXT + DEPLOY_ALLOWED_TARGETS; this
 works while deployment itself is disabled):
 
   summary   restart count, CrashLoopBackOff, last termination reason/exit code
-            (e.g. OOMKilled / 137), live resource limits of the target container
+            (e.g. OOMKilled / 137), live resource limits of the target container,
+            readiness-probe failures, and the allowlisted feature flags it runs with
   pods      per-pod phase, readiness and container states
   events    recent Warning events for the target's pods (BackOff, OOMKilling...)
   logs      last lines of the previous (crashed) container, as untrusted data
@@ -56,6 +57,15 @@ def _pod_view(pod: dict, container: str) -> dict:
     }
 
 
+def _probe_failures(events: list, probe: str) -> int:
+    """Kubelet 'Unhealthy' events for one probe type ("Readiness" / "Liveness"), summed over their counts."""
+    total = 0
+    for e in events:
+        if e.get("reason") == "Unhealthy" and str(e.get("message") or "").startswith(f"{probe} probe failed"):
+            total += e.get("count") if isinstance(e.get("count"), int) and e.get("count") > 0 else 1
+    return total
+
+
 def collect(labels: Dict, env=None, runner: Callable = dep.subprocess_runner) -> Dict:
     """Evidence dict; {"available": False, "reason": ...} when not configured or not allowed."""
     env = os.environ if env is None else env
@@ -78,6 +88,7 @@ def collect(labels: Dict, env=None, runner: Callable = dep.subprocess_runner) ->
         container = labels.get("container") or containers[0]["name"]
         index = dep.container_index(live, container)
         limits = (containers[index].get("resources") or {}).get("limits") or {}
+        flags = dep.live_flags(live, index)
         pods = [_pod_view(p, container) for p in
                 kube.get_pods(target, (live["spec"].get("selector") or {}).get("matchLabels") or {})]
         pod_names = {p["name"] for p in pods}
@@ -106,6 +117,9 @@ def collect(labels: Dict, env=None, runner: Callable = dep.subprocess_runner) ->
         "last_termination_reason": last.get("reason"),
         "last_exit_code": last.get("exit_code"),
         "live_memory_limit": limits.get("memory"), "live_cpu_limit": limits.get("cpu"),
+        "readiness_failures": _probe_failures(events, "Readiness"),
+        "liveness_failures": _probe_failures(events, "Liveness"),
+        "feature_flags": flags,
     }
     return {
         "available": True,

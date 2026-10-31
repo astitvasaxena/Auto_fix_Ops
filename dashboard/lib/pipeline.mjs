@@ -11,7 +11,7 @@ export const STAGES = [
   { key: 'context', label: 'Context', icon: '🧩', desc: 'Collects memory/CPU telemetry from Prometheus and the alert labels (CONTEXT_BUILT).' },
   { key: 'diagnosis', label: 'Diagnosis', icon: '🧠', desc: 'Rule engine + runbook RAG + local LLM report, then a sandbox-validated patch proposal (DIAGNOSED).' },
   { key: 'policy', label: 'Policy', icon: '🛡', desc: 'Safety gates and the human approval of the exact validated proposal (POLICY_APPROVED).' },
-  { key: 'remediation', label: 'Remediation', icon: '🔧', desc: 'GitHub pull request, then a controlled kubectl patch of the one approved limit.' },
+  { key: 'remediation', label: 'Remediation', icon: '🔧', desc: 'GitHub pull request, then a controlled kubectl patch of the one approved value (a limit or a feature flag).' },
   { key: 'verification', label: 'Verification', icon: '✅', desc: 'Deployment, pods, health URL, alert and headroom must stay healthy for the stabilization window.' },
 ];
 
@@ -56,6 +56,14 @@ export function pipelineStates(incident, run = null) {
     return states;
   }
   if (status === 'ESCALATED') {
+    if (run && run.final && ['FAILED', 'ROLLED_BACK', 'ROLLBACK_FAILED'].includes(run.stage)) {
+      // An approved remediation failed: show where, and that a human now owns the incident.
+      const deployed = Boolean(run.deployment?.patched);
+      states[IDX.policy] = 'completed';
+      states[IDX.remediation] = deployed ? 'completed' : 'failed';
+      states[IDX.verification] = deployed ? 'failed' : 'idle';
+      return states;
+    }
     states[IDX.policy] = 'warning';
     return states;
   }
@@ -68,6 +76,28 @@ export function pipelineStates(incident, run = null) {
   }
   if (next < STAGES.length) states[next] = 'active';
   return states;
+}
+
+// ─── Chaos page ───
+
+export const CHAOS_FAULTS = [
+  { id: 'memory_leak', name: 'Memory Leak', icon: '🧠', severity: 'HIGH',
+    kubernetes: { desc: 'The response cache stops evicting: memory grows 40 MB/min until the pod is OOMKilled, again after every restart.',
+      outcome: 'memory alerts; AutoFixOps proposes turning the cache off (RESPONSE_CACHE_ENABLED=false in deployment.yaml), never a larger limit' },
+    local: { desc: 'Calls /leak on the local process once (+10 MB).', outcome: 'a ChaosInjection incident' } },
+  { id: 'cpu_spike', name: 'CPU Spike', icon: '🔥', severity: 'MEDIUM',
+    kubernetes: { desc: 'Background work needs 130% of the CPU limit: its backlog grows, readiness fails and the pod leaves service (Running, 0/1 Ready).',
+      outcome: 'TargetAppDown alert; CPU limit increase (2x) after approval and merge' },
+    local: { desc: 'Calls /cpu on the local process (a busy loop in one thread).', outcome: 'a ChaosInjection incident' } },
+  { id: 'crash_loop', name: 'Crash Loop', icon: '💀', severity: 'HIGH',
+    kubernetes: { desc: 'Start-up needs more memory than the limit: OOMKilled at every start, CrashLoopBackOff.',
+      outcome: 'TargetAppDown alert; memory limit increase after approval and merge' },
+    local: { desc: 'Calls /_chaos/crash on the local process (exits once).', outcome: 'a ChaosInjection incident' } },
+];
+
+/** "kubernetes" when the API reports an available, chaos-enabled Kubernetes target; else "local". */
+export function chaosMode(k8s) {
+  return k8s?.chaos_enabled === true && k8s?.evidence?.available === true ? 'kubernetes' : 'local';
 }
 
 // ─── Stage 3-4 panel helpers ───

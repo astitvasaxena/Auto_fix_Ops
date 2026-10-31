@@ -136,7 +136,7 @@ class MenuStubLLM:
     def _call(self, prompt):
         text = str(prompt)
         self.prompts.append(text)
-        resource, menu = re.search(r"MENU for the (memory|cpu) limit: ([^\n]+)", text).groups()
+        field, menu = re.search(r"MENU for the ([^:\n]+): ([^\n]+)", text).groups()
         values = [v.strip() for v in menu.split(",")]
         self.menus.append(values)
         runbook = re.search(r"runbook_id ([a-z0-9-]+)\):", text).group(1)   # cite the runbook offered

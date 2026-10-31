@@ -9,7 +9,9 @@ default) so AutoFixOps can deploy an approved remediation and verify recovery.
   python scripts/k8s_demo.py teardown  [--context docker-desktop]
   python scripts/k8s_demo.py target local|k8s   # which target Prometheus scrapes
   python scripts/k8s_demo.py chaos crashloop    # start-up needs > memory limit: OOMKilled loop
-  python scripts/k8s_demo.py chaos reset        # remove the chaos requirement (manual recovery)
+  python scripts/k8s_demo.py chaos memoryleak   # response cache leaks until OOMKilled, again after restarts
+  python scripts/k8s_demo.py chaos cpuspike     # work above the CPU limit: backlog, readiness fails, 0/1 Ready
+  python scripts/k8s_demo.py chaos reset        # clear every fault (manual recovery)
 
 setup:    builds autofixops/target-app:latest, applies the namespace, the
           repository's deployment.yaml (memory limit 100Mi) and a NodePort
@@ -147,10 +149,11 @@ def chaos(context, action):
     cfg = dep.read_config({"DEPLOY_KUBE_CONTEXT": context, "DEPLOY_ALLOWED_TARGETS": f"{NAMESPACE}/{DEPLOYMENT}"})
     target = dep.Target(NAMESPACE, DEPLOYMENT, "target-app", "memory", "0", "0")
     try:
-        if action == "crashloop":
-            result = k8s_chaos.inject_crash_loop(cfg, target, _baseline_rss(context))
-        else:
+        if action == "reset":
             result = k8s_chaos.reset(cfg, target)
+        else:
+            fault = {"crashloop": "crash_loop", "memoryleak": "memory_leak", "cpuspike": "cpu_spike"}[action]
+            result = k8s_chaos.inject(cfg, target, fault)
     except dep.DeployBlocked as exc:
         sys.exit(f"{exc.code}: {exc.detail}")
     print(json.dumps(result, indent=2))
@@ -160,7 +163,7 @@ def chaos(context, action):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["setup", "status", "teardown", "target", "chaos"])
-    parser.add_argument("where", nargs="?", choices=["local", "k8s", "crashloop", "reset"])
+    parser.add_argument("where", nargs="?", choices=["local", "k8s", "crashloop", "memoryleak", "cpuspike", "reset"])
     parser.add_argument("--context", default="docker-desktop")
     args = parser.parse_args()
     if args.command == "target":
@@ -168,8 +171,8 @@ def main():
             parser.error("target needs 'local' or 'k8s'")
         set_target(args.where, args.context)
     elif args.command == "chaos":
-        if args.where not in ("crashloop", "reset"):
-            parser.error("chaos needs 'crashloop' or 'reset'")
+        if args.where not in ("crashloop", "memoryleak", "cpuspike", "reset"):
+            parser.error("chaos needs crashloop, memoryleak, cpuspike or reset")
         chaos(args.context, args.where)
     else:
         {"setup": setup, "status": status, "teardown": teardown}[args.command](args.context)
