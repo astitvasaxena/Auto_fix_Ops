@@ -28,14 +28,21 @@ groups:
             increased its memory by more than 50MB in the last 2 minutes.
             This indicates a potential memory leak and OOMKilled risk.
 
-      # ── High Absolute Memory ─────────────────────────────────
-      # Fires when RSS exceeds 85% of the 100Mi memory limit declared in
-      # kubernetes_integration/target_app/deployment.yaml (0.85 * 104857600).
-      # Baseline RSS is ~50MB. Keep this in step with the manifest limit: the
-      # Stage 2 proposer only proposes an increase at >= 80% utilisation.
+      # ── High Memory (relative to the limit in force) ─────────
+      # Fires when RSS exceeds 85% of the container memory limit, which the
+      # target exports as target_app_memory_limit_bytes (read from its cgroup),
+      # so the rule follows the limit after a remediation raises it. Without a
+      # limit metric (the local Windows process) it falls back to 85% of the
+      # manifest's 100Mi (0.85 * 104857600). The Stage 2 proposer only proposes
+      # an increase at >= 80% utilisation.
       # Annotations carry no numbers: the LLMs may only cite measured facts.
       - alert: HighMemoryUsage
-        expr: process_resident_memory_bytes{job="autofixops-target"} > 89128960
+        expr: >
+          (process_resident_memory_bytes{job="autofixops-target"}
+             / on(instance) target_app_memory_limit_bytes{job="autofixops-target"} > 0.85)
+          or
+          (process_resident_memory_bytes{job="autofixops-target"} > 89128960
+             unless on(instance) target_app_memory_limit_bytes{job="autofixops-target"})
         for: 15s
         labels:
           severity: warning

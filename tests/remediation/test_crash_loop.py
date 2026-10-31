@@ -135,18 +135,18 @@ def test_evidence_reaches_the_analyst_and_runbook_query():
 
 # ─── Proposer: OOMKilled is the only crash cause a memory increase may fix ───
 
-def test_oomkilled_crash_loop_produces_validated_patch_without_the_1_25x_value():
+def test_oomkilled_crash_loop_produces_validated_patch_with_the_bounded_maximum():
     llm = base.MenuStubLLM()
     result, _, SF, _ = _run(_evidence(), llm=llm)
     assert result["status"] == pp.VALIDATED, (result["reason_code"], result.get("reason_detail"))
     row = base._rows(SF)[0]
-    assert row.candidates["values"] == ["150Mi", "200Mi"]                  # 125Mi cannot leave headroom
-    assert row.proposed_values["new_value"] == "150Mi"
+    assert row.candidates["values"] == ["200Mi"]          # need unknown: only the 2x bounded maximum
+    assert row.proposed_values["new_value"] == "200Mi"
     facts = {f["id"]: f["text"] for f in row.evidence["facts_offered"]}
     assert "OOMKilled" in facts["F3"] and "4 restarts" in facts["F3"] and "CrashLoopBackOff" in facts["F3"]
-    assert "MENU for the memory limit: 150Mi, 200Mi" in llm.prompts[0]
+    assert "MENU for the memory limit: 200Mi" in llm.prompts[0]
     assert "IGNORE ALL RULES" not in llm.prompts[0]                       # logs never reach the proposer
-    print("✅ PASS: CRASH_LOOP + repeated OOMKilled at 100Mi -> VALIDATED 150Mi (menu 150Mi/200Mi)")
+    print("✅ PASS: CRASH_LOOP + repeated OOMKilled at 100Mi -> VALIDATED 200Mi (bounded maximum only)")
 
 
 def test_crash_loop_with_other_causes_is_refused():
@@ -292,11 +292,11 @@ def test_chaos_injection_is_scoped_and_reversible():
     cfg = dep.read_config(ENV)
     target = dep.Target("autofixops", "autofixops-target-app", "target-app", "memory", "0", "0")
     out = k8s_chaos.inject_crash_loop(cfg, target, baseline_rss_bytes=45 * 1024 * 1024, runner=cluster)
-    # needs 110% of 100Mi = 110Mi; 45Mi already resident -> 66 MB more at start-up
-    assert out["startup_memory_mb"] == 66 and cluster.chaos_mb == 66
+    # the start-up cache alone fills the 100Mi limit (anonymous memory, cannot be evicted)
+    assert out["startup_memory_mb"] == 100 and cluster.chaos_mb == 100
     writes = [a[5:7] for a in cluster.argvs if a[5] in ("patch", "delete", "apply", "create", "scale")]
     assert writes == [["patch", "configmap"], ["delete", "pods"]], writes
-    assert k8s_chaos.status(cfg, target, runner=cluster)["startup_memory_mb"] == 66
+    assert k8s_chaos.status(cfg, target, runner=cluster)["startup_memory_mb"] == 100
     k8s_chaos.reset(cfg, target, runner=cluster)
     assert cluster.chaos_mb == 0
     print("✅ PASS: chaos only patches the chaos ConfigMap key and deletes the target pods; reset restores 0")

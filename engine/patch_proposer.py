@@ -132,9 +132,9 @@ POLICY_MIN_UTILISATION = 0.80
 # Crash loop caused by the memory limit: Kubernetes must report the target container's last
 # termination as OOMKilled at least this many restarts in a row (code-collected, never LLM text).
 OOM_MIN_RESTARTS = 2
-# A container OOMKilled at limit L needs more than L, so a new limit N leaves it above L/N of N.
-# Verification requires usage below 80% of the new limit, which N = 1.25 x L can never satisfy.
-OOM_MIN_FACTOR = 1.25
+# A container OOMKilled at limit L needs more than L, but by how much is not measured. Smaller
+# increases cannot be shown to leave verification headroom, so only the largest bounded value
+# (the 2x cap) is offered; verification still checks the result and rolls back if it falls short.
 # Stage 4 verification needs usage below this share of the new limit (recovery_verifier
 # HEADROOM_MAX_UTILISATION); a value that cannot satisfy it is never offered.
 VERIFY_HEADROOM = 0.80
@@ -948,7 +948,7 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
         if span["style"] is None:   # plain scalar: keep only values that still load as the same string
             values = [v for v in values if yaml.safe_load(v) == v]
         if g["evidence_mode"] == "oom_killed":
-            values = [v for v in values if spec["parse"](v) > limit_amount * OOM_MIN_FACTOR]
+            values = values[-1:]   # need unknown (> limit): the largest bounded value only
         else:
             # Never offer a value that Stage 4 verification would certainly reject: the measured
             # peak must stay below VERIFY_HEADROOM of the new limit.
@@ -991,7 +991,7 @@ def _run(snap, cfg, system_mode, repo_root: Path, llm, settings: Settings, env, 
                      f"so it needs more than {span['value']} to start"},
         ]
         rec["review_notes"].append("evidence: repeated OOMKilled terminations (no usage measurement); "
-                                   "values that cannot leave 20% headroom were removed from the menu")
+                                   "only the largest bounded value is offered")
     else:
         peak_text = f"{peak / _MIB:.1f}Mi" if resource == "memory" else f"{peak * 1000:.0f}m"
         facts += [

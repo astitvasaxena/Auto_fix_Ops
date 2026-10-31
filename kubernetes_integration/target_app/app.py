@@ -28,6 +28,26 @@ class PortableProcessCollector:
 if not os.path.exists("/proc/self/stat"):   # not Linux: the built-in collector exports nothing
     REGISTRY.register(PortableProcessCollector())
 
+
+class ContainerLimitCollector:
+    """Exports the container's memory limit (cgroup v2/v1) so alert rules can compare usage with
+    the limit that is actually in force, which changes when a remediation raises it."""
+
+    def collect(self):
+        for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                with open(path) as fh:
+                    value = fh.read().strip()
+            except OSError:
+                continue
+            if value.isdigit() and int(value) < 2 ** 60:   # "max" / huge = no limit: export nothing
+                yield GaugeMetricFamily("target_app_memory_limit_bytes", "Container memory limit in bytes.",
+                                        value=int(value))
+            return
+
+
+REGISTRY.register(ContainerLimitCollector())
+
 # Global variables for chaos memory
 data = []
 cpu_stress_flag = False

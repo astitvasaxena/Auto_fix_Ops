@@ -2,12 +2,15 @@
 Kubernetes crash-loop chaos for the local demo (opt-in, allowlisted target only).
 ================================================================================
 The target app reads STARTUP_MEMORY_MB from the optional ConfigMap
-`target-app-chaos` and allocates that much memory when it starts (a startup
-cache that "grew"). Injection sets it so that start-up needs about 110% of the
-container's memory limit and deletes the running pod: every new container is
-OOMKilled at start, Kubernetes reports CrashLoopBackOff, and because the
-requirement lives in the ConfigMap it survives pod replacement. Only raising the
-memory limit (the remediation) or resetting the chaos value ends it.
+`target-app-chaos` and allocates (and writes) that much memory when it starts
+(a startup cache that "grew"). Injection sets it to the container's whole memory
+limit and deletes the running pod: the cache alone, plus the interpreter's own
+heap, exceeds the limit, so every new container is OOMKilled at start and
+Kubernetes reports CrashLoopBackOff. (Sizing it against the measured RSS is not
+enough: part of RSS is file-backed pages the kernel can evict, so the container
+would thrash at the limit instead of being killed.) Because the requirement
+lives in the ConfigMap it survives pod replacement; only raising the memory
+limit (the remediation) or resetting the chaos value ends it.
 
 The only cluster writes are: patch that one ConfigMap key, and delete the
 target's pods. Both are limited to the allowlisted namespace/deployment.
@@ -20,7 +23,7 @@ from engine import deployer as dep
 
 CONFIGMAP = "target-app-chaos"
 KEY = "STARTUP_MEMORY_MB"
-TARGET_SHARE_OF_LIMIT = 1.10          # start-up needs 110% of the limit -> OOMKilled every time
+CACHE_SHARE_OF_LIMIT = 1.0            # the start-up cache alone fills the limit -> OOMKilled every time
 _MIB = 1024 * 1024
 
 
@@ -61,19 +64,18 @@ def status(cfg: dep.DeployConfig, target: dep.Target, runner=dep.subprocess_runn
 
 def inject_crash_loop(cfg: dep.DeployConfig, target: dep.Target, baseline_rss_bytes: float,
                       runner=dep.subprocess_runner) -> dict:
-    """Sets the start-up requirement to ~110% of the live memory limit and restarts the pods."""
+    """Sets the start-up cache to the live memory limit and restarts the pods."""
     from engine.patch_generator import parse_memory
 
     kube = dep.Kubectl(cfg, runner)
     live = kube.get_deployment(target)
     limit = dep.live_limit(live, dep.container_index(live, target.container), "memory")
-    need = TARGET_SHARE_OF_LIMIT * parse_memory(limit)
-    mb = max(1, math.ceil((need - max(0.0, baseline_rss_bytes)) / _MIB))
+    mb = max(1, math.ceil(CACHE_SHARE_OF_LIMIT * parse_memory(limit) / _MIB))
     _set_value(kube, target.namespace, mb)
     _restart_pods(kube, target, live)
     return {"fault": "crash_loop", "startup_memory_mb": mb, "memory_limit": limit,
             "baseline_rss_mb": round(baseline_rss_bytes / _MIB, 1),
-            "expected": f"start-up needs ~{round(need / _MIB)}Mi > limit {limit}: OOMKilled -> CrashLoopBackOff"}
+            "expected": f"start-up needs {mb}Mi + the interpreter > limit {limit}: OOMKilled -> CrashLoopBackOff"}
 
 
 def reset(cfg: dep.DeployConfig, target: dep.Target, runner=dep.subprocess_runner) -> dict:
