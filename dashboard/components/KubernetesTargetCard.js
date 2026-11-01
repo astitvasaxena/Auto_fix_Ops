@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { podHealth } from '../lib/pipeline.mjs';
+import TargetAppLinks from './TargetAppLinks';
 
 const POLL_MS = 5000;
 const LABEL = { fontSize: 12, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' };
@@ -37,7 +38,15 @@ export default function KubernetesTargetCard({ showChaos = true }) {
     load();
   };
 
-  if (!data) return error ? <div className="card mb-16 text-sm" style={{ color: 'var(--error)' }}>{error}</div> : null;
+  // The target app links stay available while the status is loading or the API is unreachable.
+  if (!data) {
+    return (
+      <div className="card mb-16">
+        <TargetAppLinks loading={!error} />
+        {error && <p className="text-sm" style={{ marginTop: 8, color: 'var(--error)' }}>{error}</p>}
+      </div>
+    );
+  }
   const ev = data.evidence;
   const health = podHealth(ev);
   const s = ev?.summary || {};
@@ -50,6 +59,7 @@ export default function KubernetesTargetCard({ showChaos = true }) {
           {health.label}
         </span>
       </div>
+      <TargetAppLinks evidence={ev} />
       {!ev?.available ? (
         <p className="text-sm text-muted" style={{ marginTop: 8 }}>{ev?.reason}</p>
       ) : (
