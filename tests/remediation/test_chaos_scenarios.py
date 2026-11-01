@@ -36,7 +36,7 @@ from engine import remediation_workflow as wf
 from engine.ai_diagnostics import AIIncidentReport, build_evidence_query
 from engine.baseline import RuleBasedDiagnosisEngine
 from engine.patch_diff import PatchDiffError, check_diff_policy, parse_unified_diff_strict, make_unified_diff
-from engine.patch_generator import PatchBoundsError, PatchGenerator
+from engine.patch_generator import HARD_CAPS, PatchBoundsError, PatchGenerator, format_cpu, parse_cpu
 
 MIB = 1024 ** 2
 FLAG_LINE = '          value: "true"'
@@ -60,6 +60,14 @@ def _load_app():
         spec.loader.exec_module(app)
         sys.modules["target_app_under_test"] = app
     return app
+
+
+def _real_container():
+    """The real manifest's container as it is now. A merged remediation PR changes its CPU limit or its
+    feature flag, so tests that run against it take those values from it (as base.real_manifest_report does)."""
+    import yaml
+
+    return yaml.safe_load(REAL_MANIFEST)["spec"]["template"]["spec"]["containers"][0]
 
 
 def _evidence(**cluster):
@@ -161,13 +169,13 @@ def test_response_cache_flag_controls_the_leak():
 
 
 def test_manifest_has_the_flag_and_a_separate_readiness_probe():
-    import yaml
-
-    doc = yaml.safe_load(REAL_MANIFEST)
-    c = doc["spec"]["template"]["spec"]["containers"][0]
-    assert {"name": "RESPONSE_CACHE_ENABLED", "value": "true"} in c["env"]
+    c = _real_container()
+    # "true" until a merged leak remediation turns it off; either way a quoted string the proposer can patch.
+    flags = [e.get("value") for e in c["env"] if e.get("name") == "RESPONSE_CACHE_ENABLED"]
+    assert flags in (["true"], ["false"]), flags
+    assert '- name: RESPONSE_CACHE_ENABLED\n          value: "' in REAL_MANIFEST
     assert c["readinessProbe"]["httpGet"]["path"] == "/ready" and c["livenessProbe"]["httpGet"]["path"] == "/health"
-    print("✅ PASS: deployment.yaml: feature flag RESPONSE_CACHE_ENABLED=\"true\", readiness /ready, liveness /health")
+    print(f"✅ PASS: deployment.yaml: feature flag RESPONSE_CACHE_ENABLED={flags[0]!r}, readiness /ready, liveness /health")
 
 
 # ─── Chaos injection guards ───
@@ -260,10 +268,18 @@ def test_cpu_starved_down_target_gets_the_bounded_cpu_maximum():
     result, _, SF3, _ = base.run_case(report=_down_cpu_report(cpu_peak=0.46), raw_payload=_raw(_starved_evidence()),
                                       llm=llm)
     assert result["status"] == pp.VALIDATED and base._rows(SF3)[0].candidates["values"] == ["1"], result
-    real, _, SF2, _ = base.run_case(report=_down_cpu_report(), raw_payload=_raw(_starved_evidence()),
+    # The real manifest at its current CPU limit: the pod ran with it and peaked at 98% of it.
+    real_cpu = _real_container()["resources"]["limits"]["cpu"]
+    real_mc = parse_cpu(real_cpu)
+    expected = format_cpu(min(2 * real_mc, parse_cpu(HARD_CAPS["cpu"])))
+    rule = {"root_cause_classification": "CPU_RESOURCE_STARVATION",
+            "action": {"type": "INCREASE_CPU_LIMIT", "patch_value": expected}}
+    real, _, SF2, _ = base.run_case(report=_down_cpu_report(cpu_peak=0.98 * real_mc / 1000, rule_engine=rule),
+                                    raw_payload=_raw(_starved_evidence(cpu=real_cpu)),
                                     llm=base.MenuStubLLM(), manifest=REAL_MANIFEST)
-    assert real["status"] == pp.VALIDATED and base._rows(SF2)[0].proposed_values["new_value"] == "1", real
-    print("✅ PASS: TARGET_APP_DOWN + running-not-ready + CPU at 98% of 500m -> VALIDATED 1 core (also on the real manifest)")
+    assert real["status"] == pp.VALIDATED and base._rows(SF2)[0].proposed_values["new_value"] == expected, (real_cpu, real)
+    print(f"✅ PASS: TARGET_APP_DOWN + running-not-ready + CPU at 98% of 500m -> VALIDATED 1 core "
+          f"(real manifest: {real_cpu} -> {expected})")
 
 
 def test_cpu_outage_needs_starvation_evidence():
@@ -302,10 +318,17 @@ def test_leak_turns_the_feature_flag_off_and_nothing_else():
     assert "MENU for the RESPONSE_CACHE_ENABLED feature flag: false" in llm.prompts[0]
     facts = {f["id"]: f["text"] for f in row.evidence["facts_offered"]}
     assert "30.0 MiB/min" in facts["F3"] and 'RESPONSE_CACHE_ENABLED="true"' in facts["F4"]
-    real, _, SF2, _ = base.run_case(report=_leak_report(), raw_payload=_raw(_leak_evidence(), growth=30.0),
-                                    llm=_llm(), manifest=REAL_MANIFEST)
-    assert real["status"] == pp.VALIDATED and base._rows(SF2)[0].proposed_values["new_value"] == "false", real
-    print("✅ PASS: leak + flag on -> VALIDATED one-line diff RESPONSE_CACHE_ENABLED \"true\" -> \"false\" (real manifest too)")
+    # The real manifest with its current flag, which the pod also runs with.
+    real_flag = next(e["value"] for e in _real_container()["env"] if e["name"] == "RESPONSE_CACHE_ENABLED")
+    real, real_llm, SF2, _ = base.run_case(report=_leak_report(), llm=_llm(), manifest=REAL_MANIFEST,
+                                           raw_payload=_raw(_leak_evidence(flag=real_flag), growth=30.0))
+    if real_flag == "true":
+        assert real["status"] == pp.VALIDATED and base._rows(SF2)[0].proposed_values["new_value"] == "false", real
+    else:   # a merged leak remediation already turned it off: nothing left to turn off
+        assert (real["status"], real["reason_code"], bool(real_llm.prompts)) == (
+            pp.NOT_GENERATED, "INSUFFICIENT_EVIDENCE", False), real
+    print(f"✅ PASS: leak + flag on -> VALIDATED one-line diff RESPONSE_CACHE_ENABLED \"true\" -> \"false\" "
+          f"(real manifest: flag {real_flag!r})")
 
 
 def test_flag_is_turned_off_only_for_a_measured_leak_in_that_feature():
