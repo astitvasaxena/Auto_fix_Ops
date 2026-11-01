@@ -53,6 +53,11 @@ their remediation. You never restart it by hand.
 * **Browser:** <http://localhost:30081/health> and <http://localhost:30081/ready>.
 * **Stop:** Ctrl+C in its window. Only the processes the launcher started are stopped.
 * `START_TARGET_APP.bat -CheckOnly` only checks kubectl, the context, the service and the port.
+* **From the dashboard:** the *Kubernetes target* card (Incidents and Chaos pages) has **Open Target
+  App** (the app's `/docs` page; it has no page at `/`), **Health Check** and **Readiness Check**
+  links, opening in a new tab, with the status Kubernetes reports. The base URL comes from
+  `NEXT_PUBLIC_TARGET_APP_URL` when the dashboard is built or started (default
+  `http://localhost:30081`).
 
 It only reads from the cluster, and AutoFixOps does not use it: Prometheus scrapes the node IP and
 recovery verification goes through the API server's service proxy. A page loading in the browser is
