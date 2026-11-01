@@ -42,7 +42,7 @@ spec:
             cpu: "100m"
           limits:
             memory: "200Mi" # Very tight memory limit to ensure /leak triggers OOMKilled fast
-            cpu: "500m"
+            cpu: "1"
         livenessProbe:
           httpGet:
             path: /health
