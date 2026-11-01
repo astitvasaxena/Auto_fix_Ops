@@ -35,7 +35,7 @@ spec:
         # Feature flag for the response cache. The Memory Leak chaos fault leaks in this cache;
         # AutoFixOps may propose "false" (DISABLE_FEATURE_FLAG) through a reviewed pull request.
         - name: RESPONSE_CACHE_ENABLED
-          value: "true"
+          value: "false"
         resources:
           requests:
             memory: "64Mi"
