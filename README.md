@@ -40,6 +40,40 @@ python -m celery -A workers.celery_app worker --loglevel=info --pool=solo  # ter
 cd dashboard; npm run dev                                                   # terminal 4 → http://localhost:3000
 ```
 
+## Browser access to the Kubernetes target app
+
+Docker Desktop's kind-based cluster does not publish NodePorts on Windows, so
+`http://localhost:30081` refuses connections on its own. Double-click **`START_TARGET_APP.bat`**
+(or run `scripts\start-target-access.ps1`) to open a `kubectl port-forward` from
+`127.0.0.1:30081` to service `autofixops/target-app-nodeport` port 80 (context `docker-desktop`):
+
+* <http://localhost:30081/health> and <http://localhost:30081/ready>
+* It checks kubectl, the context, the service and that port 30081 is free (and names the program
+  holding it if not), then keeps the tunnel alive: it reconnects when kubectl drops the connection
+  and when the pod is replaced (chaos, rollout, remediation). Ctrl+C stops it.
+* It only reads from the cluster. AutoFixOps does not use it: Prometheus scrapes the node IP and
+  recovery verification goes through the API server's service proxy, so the tunnel cannot affect
+  detection or verification. A page loading in the browser is not a recovery verdict; the
+  dashboard's verification result is.
+* `START_TARGET_APP.bat -CheckOnly` runs only the checks.
+
+**Live demo:**
+1. Start Docker Desktop with Kubernetes enabled.
+2. Start the AutoFixOps API, Celery worker, Prometheus/Alertmanager (`docker compose up -d`) and the dashboard.
+3. Double-click `START_TARGET_APP.bat` and leave its window open.
+4. Open <http://localhost:30081/health> in the browser (HTTP 200, `{"status":"ok"}`).
+5. Inject a chaos fault from the dashboard (**Chaos** page).
+6. Refresh the tab: the target becomes unavailable or unready (`/ready` returns 503, or the
+   connection fails while the container restarts). The tunnel window says which.
+7. Let AutoFixOps diagnose the incident.
+8. Approve the remediation in the dashboard.
+9. Wait for the GitHub pull request and its CI checks.
+10. Merge the pull request manually on GitHub.
+11. Wait for the Kubernetes deployment and the recovery verification in the dashboard. The tunnel
+    reconnects to the new pod by itself ("reconnected: ... (refresh the browser)").
+12. Refresh the target app's browser tab.
+13. Confirm HTTP 200 and the healthy response, and that the dashboard reports the recovery as verified.
+
 ## Security and limitations
 
 * **Local demonstration only.** Approvals are recorded as unauthenticated and accepted
