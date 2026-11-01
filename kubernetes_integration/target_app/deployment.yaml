@@ -41,7 +41,7 @@ spec:
             memory: "64Mi"
             cpu: "100m"
           limits:
-            memory: "200Mi" # Very tight memory limit to ensure /leak triggers OOMKilled fast
+            memory: "400Mi" # Very tight memory limit to ensure /leak triggers OOMKilled fast
             cpu: "1"
         livenessProbe:
           httpGet:
