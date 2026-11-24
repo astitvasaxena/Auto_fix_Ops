@@ -11,3 +11,5 @@ qdrant_data
 *.db
 *.sqlite3
 deploy/secrets
+
+.kube

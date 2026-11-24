@@ -34,9 +34,11 @@ export default function TargetAppLinks({ evidence, loading = false }) {
             {status.label}
           </span>
         </div>
-        <div className="text-muted" style={{ fontSize: 12, marginTop: 2 }}>
-          On Docker Desktop the links need the browser-access launcher (<span className="mono">START_TARGET_APP.bat</span>) running.
-        </div>
+        {TARGET_APP.host.startsWith('localhost') && (
+          <div className="text-muted" style={{ fontSize: 12, marginTop: 2 }}>
+            On Docker Desktop the links need the browser-access launcher (<span className="mono">START_TARGET_APP.bat</span>) running.
+          </div>
+        )}
       </div>
       <div className="flex" style={{ gap: 8, flexWrap: 'wrap' }}>
         {LINKS.map(({ key, label }) => (
