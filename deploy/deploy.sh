@@ -47,6 +47,28 @@ if [ -n "${DASH_PASSWORD:-}" ]; then
 fi
 [ -s $D/secrets/htpasswd ] || { echo "missing $D/secrets/htpasswd (pass DASH_PASSWORD on first run)"; exit 1; }
 
+# Real Kubernetes target (k3s) + least-privilege kubeconfig; must exist before the containers mount it.
+sudo bash $D/k3s-bootstrap.sh
+
+# Settings that must hold on every deploy (existing servers keep their secrets; keys are only added/updated).
+setenv() { if grep -q "^$1=" $D/.env.prod; then sed -i "s#^$1=.*#$1=$2#" $D/.env.prod; else echo "$1=$2" >> $D/.env.prod; fi; }
+ensure() { grep -q "^$1=" $D/.env.prod || echo "$1=$2" >> $D/.env.prod; }
+ensure APPROVER_TOKEN "$(openssl rand -hex 24)"
+setenv APPROVER_TOKENS "dashboard:$(grep '^APPROVER_TOKEN=' $D/.env.prod | cut -d= -f2)"
+ensure ENCRYPTION_KEY "$(python3 -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+setenv SHADOW_MODE false
+setenv REMEDIATION_REQUIRE_PR true
+setenv REMEDIATION_REQUIRE_CI true
+setenv DEPLOY_MODE kubectl
+setenv DEPLOY_KUBE_CONTEXT autofixops
+setenv DEPLOY_ALLOWED_TARGETS autofixops/autofixops-target-app
+setenv VERIFY_HEALTH_URL kube-service://autofixops/target-app-nodeport:80/health
+setenv VERIFY_STABILIZATION_SECONDS 60
+setenv CHAOS_K8S_ENABLED true
+setenv TARGET_NAMESPACE autofixops
+setenv TARGET_WORKLOAD autofixops-target-app
+setenv GITHUB_REPO astitvasaxena/Auto_fix_Ops
+
 $DC up -d --build --remove-orphans
 
 echo "waiting for api health..."

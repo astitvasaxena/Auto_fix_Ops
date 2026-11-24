@@ -9,14 +9,19 @@ x-app: &app
     dockerfile: deploy/Dockerfile.api
   env_file: .env.prod
   restart: unless-stopped
+  extra_hosts: ["host.docker.internal:host-gateway"]   # reach the host's k3s API (6443)
+  volumes: ["/opt/autofixops/kube/config:/etc/autofixops/kubeconfig:ro"]
   logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
 
 services:
   nginx:
     image: nginx:1.27-alpine
     ports: ["80:80"]
+    environment:
+      APPROVER_TOKEN: ${APPROVER_TOKEN}
+      NGINX_ENVSUBST_FILTER: "^APPROVER_TOKEN$$"
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
       - ./secrets/htpasswd:/etc/nginx/htpasswd:ro
     depends_on: [api, dashboard]
     restart: unless-stopped
@@ -47,10 +52,6 @@ services:
       dockerfile: deploy/Dockerfile.dashboard
       args:
         NEXT_PUBLIC_API_URL: ${PUBLIC_BASE_URL}
-    restart: unless-stopped
-
-  target-app:
-    build: ../kubernetes_integration/target_app
     restart: unless-stopped
 
   postgres:
@@ -87,6 +88,7 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ../monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus_data:/prometheus
+    extra_hosts: ["host.docker.internal:host-gateway"]   # scrape the target pod's NodePort on the host
     depends_on: [alertmanager]
     restart: unless-stopped
 
