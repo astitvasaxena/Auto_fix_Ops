@@ -1,0 +1,29 @@
+# Production Prometheus config (docker network names instead of host.docker.internal).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # job_name must stay "autofixops-target": monitoring/alert_rules.yml selects on it.
+  - job_name: 'autofixops-target'
+    scheme: http
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['target-app:8000']
+        labels:
+          environment: 'aws'
+          app: 'target-app'
+          service: 'target-app'

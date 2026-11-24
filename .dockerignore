@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+**/node_modules
+**/.next
+**/__pycache__
+venv
+docs
+Documents
+qdrant_data
+*.db
+*.sqlite3
+deploy/secrets

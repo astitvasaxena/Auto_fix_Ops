@@ -1,0 +1,58 @@
+# AutoFixOps CD: after CI succeeds on main, deploy that exact commit to the AWS host.
+#
+# No AWS keys are stored in GitHub. The job assumes an IAM role through GitHub OIDC; that role can
+# only run AWS-RunShellScript on the one AutoFixOps instance. The server pulls the commit itself
+# and rebuilds with docker compose (deploy/deploy.sh). Port 22 is closed; SSM is the only path in.
+#
+# The role ARN and instance id are not secrets, so they default below. To point at another host,
+# set the Actions variables AWS_DEPLOY_ROLE_ARN and AWS_DEPLOY_INSTANCE_ID, which take precedence.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to AWS
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ap-south-1
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN || 'arn:aws:iam::234768038948:role/autofixops-github-deploy' }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run deploy on the instance via SSM
+        env:
+          INSTANCE_ID: ${{ vars.AWS_DEPLOY_INSTANCE_ID || 'i-03f606257b5b69a81' }}
+        run: |
+          set -euo pipefail
+          CMD="sudo -u ubuntu -H bash -c 'cd /opt/autofixops/app && AUTOFIXOPS_PULL=1 AUTOFIXOPS_REF=${DEPLOY_SHA} bash deploy/deploy.sh' 2>&1 | tail -n 60"
+          CID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
+                --parameters "commands=[\"$CMD\"]" --timeout-seconds 2400 \
+                --query Command.CommandId --output text)
+          echo "SSM command: $CID"
+          for i in $(seq 1 450); do
+            ST=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$ST" in Success|Failed|TimedOut|Cancelled) break;; esac
+            sleep 5
+          done
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text
+          [ "$ST" = "Success" ] || { echo "Deploy finished with status: $ST"; exit 1; }

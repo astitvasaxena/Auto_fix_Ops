@@ -34,3 +34,7 @@ node_modules/
 
 # Sibling repo — has its own git history and pushes to test-app.git
 testapp/
+
+# Deployment secrets (generated on the server)
+deploy/.env.prod
+deploy/secrets/
