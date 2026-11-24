@@ -1,0 +1,18 @@
+# AutoFixOps API + Celery worker image (same image, different command).
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/opt/hf
+WORKDIR /app
+COPY requirements.txt .
+# CPU-only torch keeps the image ~2 GB smaller; sentence-transformers needs no GPU here.
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
+ && pip install -r requirements.txt
+# Bake the embedding model into the image so the first incident never downloads it.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+COPY . .
+RUN useradd -r -u 10001 appuser && chown -R appuser /app /opt/hf
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
