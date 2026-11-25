@@ -35,14 +35,14 @@ spec:
         # Feature flag for the response cache. The Memory Leak chaos fault leaks in this cache;
         # AutoFixOps may propose "false" (DISABLE_FEATURE_FLAG) through a reviewed pull request.
         - name: RESPONSE_CACHE_ENABLED
-          value: "false"
+          value: "true"
         resources:
           requests:
             memory: "64Mi"
             cpu: "100m"
           limits:
-            memory: "400Mi" # Very tight memory limit to ensure /leak triggers OOMKilled fast
-            cpu: "1"
+            memory: "200Mi" # Very tight memory limit to ensure /leak triggers OOMKilled fast
+            cpu: "500m"
         livenessProbe:
           httpGet:
             path: /health
