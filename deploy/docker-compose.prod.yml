@@ -10,7 +10,10 @@ x-app: &app
   env_file: .env.prod
   restart: unless-stopped
   extra_hosts: ["host.docker.internal:host-gateway"]   # reach the host's k3s API (6443)
-  volumes: ["/opt/autofixops/kube/config:/etc/autofixops/kubeconfig:ro"]
+  volumes:
+    - /opt/autofixops/kube/config:/etc/autofixops/kubeconfig:ro
+    # The image excludes .git; the patch proposer reads 'origin' from this one file (REPO_MISMATCH without it).
+    - ../.git/config:/app/.git/config:ro
   logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
 
 services:
