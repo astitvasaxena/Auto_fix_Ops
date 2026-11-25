@@ -38,3 +38,5 @@ testapp/
 # Deployment secrets (generated on the server)
 deploy/.env.prod
 deploy/secrets/
+
+.kube/

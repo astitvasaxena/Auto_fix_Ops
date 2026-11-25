@@ -3,7 +3,12 @@
 # it, and writes a least-privilege kubeconfig for AutoFixOps. Safe to re-run on every deploy:
 # it never overwrites a live Deployment or chaos ConfigMap (remediation PRs manage those).
 set -euo pipefail
+# Run via sudo from the repo checkout: keep kubectl's cache in root's home, never inside the repo
+# (a root-owned .kube in the build context makes `docker compose build` fail for the deploy user).
+export HOME=/root
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd /
 K3S_VERSION="${K3S_VERSION:-v1.31.4+k3s1}"
 KUBE_DIR=/opt/autofixops/kube
 NS=autofixops

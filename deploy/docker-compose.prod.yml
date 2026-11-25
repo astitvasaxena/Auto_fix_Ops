@@ -17,6 +17,7 @@ services:
   nginx:
     image: nginx:1.27-alpine
     ports: ["80:80"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
     environment:
       APPROVER_TOKEN: ${APPROVER_TOKEN}
       NGINX_ENVSUBST_FILTER: "^APPROVER_TOKEN$$"
@@ -52,6 +53,7 @@ services:
       dockerfile: deploy/Dockerfile.dashboard
       args:
         NEXT_PUBLIC_API_URL: ${PUBLIC_BASE_URL}
+        NEXT_PUBLIC_TARGET_APP_URL: ${PUBLIC_BASE_URL}/target
     restart: unless-stopped
 
   postgres:
