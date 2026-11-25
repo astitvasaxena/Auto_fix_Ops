@@ -79,12 +79,22 @@ def reset(api, settle_s):
     return False
 
 
+def quiet(api, seconds):
+    """Waits out the previous fault's tail (restart-count alerts clear minutes after the pod is healthy) and
+    closes any incident it still raises, so the next trial's incident cannot be confused with the last one's."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        for i in open_incidents(api):
+            api.call("POST", f"/api/v1/incidents/{i['id']}/close", {"reason": "real-chaos evaluation: previous trial's tail"})
+        time.sleep(20)
+
+
 def run_trial(api, fault, args):
     record = {"fault": fault, "ground_truth": TRUTH[fault], "started_utc": datetime.now(timezone.utc).isoformat()}
     if not reset(api, args.settle):
         record["error"] = "target did not become ready before the trial"
         return record
-    time.sleep(args.quiet)                       # let Prometheus see a healthy target and resolve old alerts
+    quiet(api, args.quiet)                       # let Prometheus resolve the previous fault's alerts
     before = {i["id"] for i in open_incidents(api)}
     t_inject = datetime.now(timezone.utc)
     record["injected_utc"] = t_inject.isoformat()
