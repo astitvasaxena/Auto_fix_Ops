@@ -12,6 +12,21 @@ if [ "${AUTOFIXOPS_PULL:-0}" = "1" ]; then
   git fetch --quiet origin main && git reset --hard "${AUTOFIXOPS_REF:-origin/main}"   # untracked deploy/.env.prod and secrets survive
 fi
 
+# A build on a full disk puts k3s under DiskPressure, which evicts the target app. Reclaim only
+# unused Docker data (dangling images and build cache), and stop before building if still too full.
+MIN_FREE_GB=${MIN_FREE_GB:-9}       # below this, reclaim space
+ABORT_FREE_GB=${ABORT_FREE_GB:-5}   # below this after reclaiming, do not build
+free_gb() { df -Pk / | awk 'NR==2 {print int($4 / 1048576)}'; }
+reclaim_disk() {
+  [ "$(free_gb)" -ge "$MIN_FREE_GB" ] && return 0
+  echo "disk: $(free_gb) GB free, removing dangling images and unused build cache"
+  docker image prune -f >/dev/null
+  docker builder prune -f >/dev/null
+  echo "disk: $(free_gb) GB free after cleanup"
+}
+reclaim_disk
+[ "$(free_gb)" -ge "$ABORT_FREE_GB" ] || { echo "only $(free_gb) GB free (need $ABORT_FREE_GB): not deploying"; exit 1; }
+
 umask 077
 mkdir -p $D/secrets
 if [ ! -f $D/.env.prod ]; then
@@ -84,4 +99,6 @@ $DC exec -T worker python scripts/seed_rag_runbooks.py || echo "WARN: runbook se
 curl -fsS http://127.0.0.1/healthz
 $DC ps
 docker image prune -f >/dev/null
+reclaim_disk
+echo "disk: $(free_gb) GB free"
 echo "deploy ok"

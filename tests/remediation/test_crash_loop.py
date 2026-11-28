@@ -127,6 +127,33 @@ def test_evidence_collects_restarts_termination_events_and_clean_logs():
     print("✅ PASS: read-only evidence: restarts, OOMKilled/137, CrashLoopBackOff, events, sanitized logs")
 
 
+def test_evidence_ignores_finished_pod_records():
+    dead = [{"metadata": {"name": f"autofixops-target-app-old-{phase.lower()}"},
+             "status": {"phase": phase, "conditions": [{"type": "Ready", "status": "False"}],
+                        "containerStatuses": [{"name": "target-app", "restartCount": 99,
+                                               "lastState": {"terminated": {"reason": "Error", "exitCode": 1}}}]}}
+            for phase in ("Failed", "Succeeded")]
+
+    class WithDeadPods(FakeCluster):
+        live = True
+
+        def __call__(self, argv, timeout):
+            result = super().__call__(argv, timeout)
+            if argv[5:7] != ["get", "pods"]:
+                return result
+            items = json.loads(result.stdout)["items"] if self.live else []
+            return dep.CommandResult(0, json.dumps({"items": dead + items}), "")
+
+    s = k8s_evidence.collect(LABELS, env=ENV, runner=WithDeadPods())["summary"]
+    assert (s["pods"], s["restart_count"], s["last_termination_reason"]) == (1, 4, "OOMKilled"), s
+    only_dead = WithDeadPods()
+    only_dead.live = False
+    ev = k8s_evidence.collect(LABELS, env=ENV, runner=only_dead)
+    assert ev["pods"] == [] and ev["logs_previous_container"] == []
+    assert (ev["summary"]["pods"], ev["summary"]["restart_count"], ev["summary"]["last_termination_reason"]) == (0, 0, None)
+    print("✅ PASS: evicted/completed pod records never count as pods, restarts or terminations")
+
+
 def test_evidence_needs_explicit_context_and_allowlist():
     assert k8s_evidence.collect(LABELS, env={})["available"] is False
     other = dict(ENV, DEPLOY_ALLOWED_TARGETS="autofixops/other")
