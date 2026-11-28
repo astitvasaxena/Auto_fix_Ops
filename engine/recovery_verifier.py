@@ -145,13 +145,17 @@ def run_round(kube: Kubectl, t: Target, cfg: VerifyConfig, alert_name: str,
         if t.resource == "env":
             headroom_limit = live_limit(live, index, "memory")
         pods = kube.get_pods(t, (spec.get("selector") or {}).get("matchLabels") or {})
-        problems = []
+        problems, checked = [], 0
         for pod in pods:
             name = pod["metadata"]["name"]
             if pod.get("metadata", {}).get("deletionTimestamp"):
                 continue   # an old pod still terminating after the rollout
+            phase = (pod.get("status") or {}).get("phase")
+            if phase in ("Failed", "Succeeded") and name not in (baseline_restarts or {}):
+                continue   # a record of an earlier dead pod; one that dies during verification still fails it
+            checked += 1
             conditions = {c.get("type"): c.get("status") for c in (pod.get("status") or {}).get("conditions") or []}
-            if (pod.get("status") or {}).get("phase") != "Running" or conditions.get("Ready") != "True":
+            if phase != "Running" or conditions.get("Ready") != "True":
                 problems.append(f"{name} not running/ready")
             for cs in (pod.get("status") or {}).get("containerStatuses") or []:
                 restarts[name] = restarts.get(name, 0) + int(cs.get("restartCount", 0))
@@ -160,9 +164,9 @@ def run_round(kube: Kubectl, t: Target, cfg: VerifyConfig, alert_name: str,
                     problems.append(f"{name} waiting: {reason}")
             if baseline_restarts and name in baseline_restarts and restarts.get(name, 0) > baseline_restarts[name]:
                 problems.append(f"{name} restarted during verification")
-        if not pods:
+        if not checked:
             problems.append("no pods found")
-        checks.append(_check("pods_healthy", not problems, "; ".join(problems) or f"{len(pods)} pod(s) running and ready"))
+        checks.append(_check("pods_healthy", not problems, "; ".join(problems) or f"{checked} pod(s) running and ready"))
     except DeployBlocked as exc:
         checks.append(_check("deployment_ready", False, f"{exc.code}: {exc.detail}"))
     except Exception as exc:   # unexpected kubectl output never crashes a round; it fails it

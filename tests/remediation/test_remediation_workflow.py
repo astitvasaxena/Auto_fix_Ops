@@ -866,6 +866,35 @@ def test_pods_never_ready_after_rollout_rolls_back():
     print("✅ PASS: pod not ready after the rollout → rollback, incident ESCALATED")
 
 
+def test_dead_pod_records_are_ignored_but_a_pod_dying_during_verification_fails():
+    live = {"metadata": {"name": "live"}, "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}],
+                                                     "containerStatuses": [{"restartCount": 0, "state": {}}]}}
+    evicted = {"metadata": {"name": "old"}, "status": {"phase": "Failed"}}
+
+    def pods_check(items, baseline):
+        class Kube(FakeKube):
+            def __call__(self, argv, timeout):
+                if argv[5:7] == ["get", "pods"]:
+                    return dep.CommandResult(0, json.dumps({"items": items}), "")
+                return super().__call__(argv, timeout)
+
+        w = World(kube=Kube())
+        run_id = w.to_verifying()
+        w.clock.tick(10)
+        view = w.advance(run_id)
+        if baseline is not None:
+            items[:] = baseline
+            w.clock.tick(10)
+            view = w.advance(run_id)
+        return {c["name"]: c for c in view["verification"]["rounds"][-1]["checks"]}["pods_healthy"]
+
+    assert pods_check([evicted, live], None)["ok"]
+    assert not pods_check([evicted], None)["ok"]                       # only dead records: no pods found
+    died = {"metadata": {"name": "live"}, "status": {"phase": "Failed"}}
+    assert not pods_check([live], [died])["ok"]                        # seen alive, then died
+    print("✅ PASS: old dead pod records ignored; a pod that dies during verification still fails it")
+
+
 def test_github_api_error_while_opening_the_pr_blocks_and_retries():
     from engine.github_gateway import GitHubError
 

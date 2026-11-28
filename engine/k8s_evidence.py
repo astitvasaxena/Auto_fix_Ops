@@ -26,6 +26,7 @@ from engine.telemetry import DEFAULT_WORKLOAD
 
 MAX_EVENTS = 10
 MAX_LOG_LINES = 20
+FINISHED_PHASES = ("Failed", "Succeeded")   # dead pod records (evicted, completed): never live evidence
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f‪-‮⁦-⁩]")
 
 
@@ -91,14 +92,16 @@ def collect(labels: Dict, env=None, runner: Callable = dep.subprocess_runner) ->
         flags = dep.live_flags(live, index)
         pods = [_pod_view(p, container) for p in
                 kube.get_pods(target, (live["spec"].get("selector") or {}).get("matchLabels") or {})]
-        pod_names = {p["name"] for p in pods}
+        # Kubernetes keeps finished pods as records; counting them reports phantom pods, restarts and OOM kills.
+        alive = [p for p in pods if p["phase"] not in FINISHED_PHASES]
+        active = [p for p in alive if not p["terminating"]] or alive
+        pod_names = {p["name"] for p in active}
         events = [e for e in kube.get_events(namespace)
                   if (e.get("involvedObject") or {}).get("name") in pod_names | {workload}]
         events.sort(key=lambda e: e.get("lastTimestamp") or e.get("eventTime") or "", reverse=True)
     except (dep.DeployBlocked, KeyError, IndexError, TypeError, ValueError) as exc:
         return {"available": False, "reason": f"kubectl read failed: {getattr(exc, 'code', type(exc).__name__)}"}
 
-    active = [p for p in pods if not p["terminating"]] or pods
     worst = max(active, key=lambda p: p["restart_count"], default=None)
     logs = []
     if worst and worst["restart_count"] > 0:
